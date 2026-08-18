@@ -141,6 +141,40 @@ resource "aws_vpc_security_group_ingress_rule" "worker_from_bastion" {
   description                  = "haproxy to worker ingress ${each.key}"
 }
 
+# ---- the kubernetes Service ClusterIP (172.30.0.1:443) ----
+#
+# Every in-cluster client reaches the API through this Service, and OVN
+# DNATs it to whichever node currently backs it -- bootstrap during
+# bring-up, the masters once bootstrap is torn down. That DNAT'd packet
+# leaves the node directly, NOT through the bastion, so the bastion-sourced
+# rules above never cover it.
+#
+# Missing these two stalled an entire cluster for real: every operator pod
+# got `dial tcp 172.30.0.1:443: i/o timeout` (a silent SG drop, not a
+# refused connection), so service-ca-operator never issued the *-serving-cert
+# secrets, ~15 pods sat in ContainerCreating on FailedMount, MCO never ran,
+# and the masters never received their etcd/kube-apiserver static pod
+# manifests. Nothing in the earlier bring-up exercises this path, because
+# every other route to the API (HAProxy, api-int:22623) goes via the bastion.
+
+resource "aws_vpc_security_group_ingress_rule" "bootstrap_api_from_master" {
+  security_group_id            = aws_security_group.bootstrap.id
+  referenced_security_group_id = aws_security_group.master.id
+  ip_protocol                  = "tcp"
+  from_port                    = 6443
+  to_port                      = 6443
+  description                  = "kubernetes Service ClusterIP to bootstrap API during bring-up"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "master_api_from_master" {
+  security_group_id            = aws_security_group.master.id
+  referenced_security_group_id = aws_security_group.master.id
+  ip_protocol                  = "tcp"
+  from_port                    = 6443
+  to_port                      = 6443
+  description                  = "kubernetes Service ClusterIP to master API once bootstrap is gone"
+}
+
 # ---- intra-cluster: etcd (masters only) + kubelet (all nodes) ----
 
 resource "aws_vpc_security_group_ingress_rule" "etcd" {
