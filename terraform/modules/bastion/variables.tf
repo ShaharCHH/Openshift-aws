@@ -63,6 +63,19 @@ variable "aws_region" {
   type = string
 }
 
+variable "oc_version" {
+  type        = string
+  default     = "stable-4.22"
+  description = <<-EOT
+    Release channel or exact version directory under
+    mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/ to install the
+    oc client from (e.g. "stable-4.22", "latest", "4.22.9"). Should track the
+    cluster's own version. Installed best-effort -- a failed download logs a
+    warning rather than aborting the bastion's setup, since oc is an operator
+    convenience and everything else in that script is load-bearing.
+  EOT
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

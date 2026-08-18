@@ -74,6 +74,7 @@ locals {
     upstream_dns         = var.upstream_dns
     ignition_bucket_name = var.ignition_bucket_name
     aws_region           = var.aws_region
+    oc_version           = var.oc_version
     haproxy_cfg          = local.initial_haproxy_cfg
   })
 }

@@ -7,10 +7,41 @@
 # the self-heal timer this script installs).
 set -euo pipefail
 
-dnf install -y docker bind-utils awscli
+dnf install -y docker bind-utils awscli tar gzip
 systemctl enable --now docker
 
 mkdir -p /etc/coredns /etc/haproxy /var/ignition-serve/ignition /var/ignition-serve/haproxy
+
+# ---- oc/kubectl, for talking to the cluster from here rather than through the tunnel ----
+# The SSM tunnel does not tolerate two heavy consumers: running oc from the
+# operator's machine while `openshift-install wait-for` holds the same tunnel
+# produces TLS handshake timeouts on the oc side that look like a cluster
+# fault and are not (docs/runbook.md). Running oc here instead talks to the
+# API directly over the VPC network with no tunnel in the path.
+#
+# Best-effort: a failed download must not abort this script, or the
+# ignition/haproxy setup below never happens and no node can boot at all.
+# oc is an operator convenience; everything below it is load-bearing.
+(
+  for attempt in 1 2 3; do
+    if curl -fsSL --retry 2 --connect-timeout 15 \
+        "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${oc_version}/openshift-client-linux.tar.gz" \
+        -o /tmp/oc.tar.gz; then
+      tar -xzf /tmp/oc.tar.gz -C /usr/local/bin oc kubectl && chmod +x /usr/local/bin/oc /usr/local/bin/kubectl
+      rm -f /tmp/oc.tar.gz
+      break
+    fi
+    sleep 10
+  done
+) || echo "WARNING: oc install failed; cluster setup continues without it" >&2
+
+# The cluster's API names resolve only through the CoreDNS container started
+# below, which is not up yet and which this host does not use as its own
+# resolver. Point them at ourselves directly so oc works from here -- HAProxy
+# on this same host is what fronts the API anyway.
+cat >>/etc/hosts <<HOSTS_EOF
+${private_ip} api.${cluster_name}.${base_domain} api-int.${cluster_name}.${base_domain}
+HOSTS_EOF
 
 # ---- CoreDNS: everything resolves to this instance's own (pinned) IP ----
 
