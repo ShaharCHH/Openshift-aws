@@ -1,5 +1,9 @@
 # Architecture
 
+This file explains *why* the design looks the way it does. For the
+ordered command sequence to actually deploy a cluster, see
+`docs/runbook.md`.
+
 ## Why this looks different from a standard OpenShift UPI install
 
 This account's SCP blocks Route 53, ELB/NLB creation, Elastic IPs, launching
@@ -82,9 +86,12 @@ Phase 2):
    machine CIDR (derived from the VPC's own CIDR), cluster name/domain, pull
    secret, SSH key. No hand-typed network values, no interactive wizard.
 2. `openshift-install create manifests` expands that into individual
-   manifests and consumes the input file. `manifests/cluster-scheduler-02-config.yml`
-   gets patched to `mastersSchedulable: false` here — the standard UPI step,
-   done at this point because it's the last point manifests are editable.
+   manifests and consumes the input file. No manifest patching happens here:
+   a standard UPI install would set `mastersSchedulable: false` in
+   `manifests/cluster-scheduler-02-config.yml` at this point, but this is a
+   compact topology (`compute.replicas: 0`), where the installer already
+   leaves masters schedulable and they're meant to carry ordinary workloads
+   and ingress themselves.
 3. `openshift-install create ignition-configs` produces `bootstrap.ign`,
    `master.ign`, `worker.ign`, plus `auth/kubeconfig` and
    `auth/kubeadmin-password`.

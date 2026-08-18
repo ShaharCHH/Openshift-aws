@@ -108,7 +108,7 @@ variable "cluster_infra_id" {
   EOT
 }
 
-# Phase toggles -- flipped via CLI -var at each runbook stage, not committed
+# Phase toggles -- flipped via CLI -var at each stage of docs/runbook.md, not committed
 # to accounts/*.tfvars, so tfvars git history reflects steady-state config,
 # not transient bring-up state.
 

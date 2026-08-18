@@ -1,7 +1,7 @@
 # The temporary bootstrap node. Gated by var.bootstrap_enabled at the root
 # level so a later apply with that flag flipped cleanly destroys it once
 # `openshift-install wait-for bootstrap-complete` returns -- see
-# docs/architecture.md's runbook.
+# docs/runbook.md's Phase 6.
 
 locals {
   pointer_ignition = jsonencode({
