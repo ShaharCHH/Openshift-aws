@@ -1,0 +1,11 @@
+# Copy this file to <account-alias>.tfvars (e.g. acme-corp.tfvars) and fill
+# in real values for that client's AWS account.
+
+aws_region                 = "il-central-1"
+existing_vpc_id             = "vpc-xxxxxxxxxxxxxxxxx"
+existing_private_subnet_id  = "subnet-xxxxxxxxxxxxxxxxx"
+
+account_alias = "acme-corp"       # matches this file's own name
+cluster_name  = "ocp"
+base_domain   = "ocp.internal"    # purely internal -- CoreDNS on the bastion
+                                   # resolves it, no real DNS delegation needed

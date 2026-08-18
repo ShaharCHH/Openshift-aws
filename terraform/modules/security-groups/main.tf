@@ -1,0 +1,170 @@
+# Four security groups: bastion (CoreDNS+HAProxy), master, worker, bootstrap.
+#
+# Cross-references between these groups are done as standalone
+# aws_vpc_security_group_ingress_rule resources rather than inline
+# ingress {} blocks on aws_security_group — two SGs whose inline rules
+# reference each other's id form a real dependency cycle at apply time;
+# standalone rule resources don't, since the (ruleless) groups exist first.
+
+resource "aws_security_group" "bastion" {
+  name_prefix = "${var.name_prefix}-bastion-"
+  description = "Bastion: CoreDNS (DNS) + HAProxy (API/MCS/ingress LB)"
+  vpc_id      = var.vpc_id
+  tags        = merge(var.tags, { Name = "${var.name_prefix}-bastion" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "master" {
+  name_prefix = "${var.name_prefix}-master-"
+  description = "OpenShift control plane"
+  vpc_id      = var.vpc_id
+  tags        = merge(var.tags, { Name = "${var.name_prefix}-master" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "worker" {
+  name_prefix = "${var.name_prefix}-worker-"
+  description = "OpenShift compute"
+  vpc_id      = var.vpc_id
+  tags        = merge(var.tags, { Name = "${var.name_prefix}-worker" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "bootstrap" {
+  name_prefix = "${var.name_prefix}-bootstrap-"
+  description = "OpenShift temporary bootstrap node"
+  vpc_id      = var.vpc_id
+  tags        = merge(var.tags, { Name = "${var.name_prefix}-bootstrap" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# ---- egress: every group can reach anywhere (S3 ignition fetch, SSM, etc.) ----
+
+resource "aws_vpc_security_group_egress_rule" "all_egress" {
+  for_each = {
+    bastion   = aws_security_group.bastion.id
+    master    = aws_security_group.master.id
+    worker    = aws_security_group.worker.id
+    bootstrap = aws_security_group.bootstrap.id
+  }
+
+  security_group_id = each.value
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "allow all outbound"
+}
+
+# ---- bastion ingress: master/worker/bootstrap talk to CoreDNS(53), HAProxy(6443/22623/443/80),
+# and the bastion's own ignition HTTP server (8080 -- see docs/architecture.md; deliberately not
+# 80/443, which HAProxy already owns for cluster ingress traffic) ----
+
+locals {
+  bastion_ports = {
+    dns_tcp  = { port = 53, proto = "tcp" }
+    dns_udp  = { port = 53, proto = "udp" }
+    api      = { port = 6443, proto = "tcp" }
+    mcs      = { port = 22623, proto = "tcp" }
+    https    = { port = 443, proto = "tcp" }
+    http     = { port = 80, proto = "tcp" }
+    ignition = { port = 8080, proto = "tcp" }
+  }
+  bastion_sources = {
+    master    = aws_security_group.master.id
+    worker    = aws_security_group.worker.id
+    bootstrap = aws_security_group.bootstrap.id
+  }
+  bastion_ingress = {
+    for pair in setproduct(keys(local.bastion_ports), keys(local.bastion_sources)) :
+    "${pair[0]}-${pair[1]}" => {
+      port   = local.bastion_ports[pair[0]].port
+      proto  = local.bastion_ports[pair[0]].proto
+      source = local.bastion_sources[pair[1]]
+    }
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "bastion" {
+  for_each = local.bastion_ingress
+
+  security_group_id            = aws_security_group.bastion.id
+  referenced_security_group_id = each.value.source
+  ip_protocol                  = each.value.proto
+  from_port                    = each.value.port
+  to_port                      = each.value.port
+  description                  = "bastion from ${each.key}"
+}
+
+# ---- HAProxy on the bastion reaching real backends ----
+
+resource "aws_vpc_security_group_ingress_rule" "master_from_bastion" {
+  for_each = { api = 6443, mcs = 22623 }
+
+  security_group_id            = aws_security_group.master.id
+  referenced_security_group_id = aws_security_group.bastion.id
+  ip_protocol                  = "tcp"
+  from_port                    = each.value
+  to_port                      = each.value
+  description                  = "haproxy to master ${each.key}"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "bootstrap_from_bastion" {
+  for_each = { api = 6443, mcs = 22623 }
+
+  security_group_id            = aws_security_group.bootstrap.id
+  referenced_security_group_id = aws_security_group.bastion.id
+  ip_protocol                  = "tcp"
+  from_port                    = each.value
+  to_port                      = each.value
+  description                  = "haproxy to bootstrap ${each.key}"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "worker_from_bastion" {
+  for_each = { http = 80, https = 443 }
+
+  security_group_id            = aws_security_group.worker.id
+  referenced_security_group_id = aws_security_group.bastion.id
+  ip_protocol                  = "tcp"
+  from_port                    = each.value
+  to_port                      = each.value
+  description                  = "haproxy to worker ingress ${each.key}"
+}
+
+# ---- intra-cluster: etcd (masters only) + kubelet (all nodes) ----
+
+resource "aws_vpc_security_group_ingress_rule" "etcd" {
+  security_group_id            = aws_security_group.master.id
+  referenced_security_group_id = aws_security_group.master.id
+  ip_protocol                  = "tcp"
+  from_port                    = 2379
+  to_port                      = 2380
+  description                  = "etcd peer + client"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "kubelet" {
+  for_each = {
+    master_from_master    = { sg = aws_security_group.master.id, src = aws_security_group.master.id }
+    master_from_worker    = { sg = aws_security_group.master.id, src = aws_security_group.worker.id }
+    master_from_bootstrap = { sg = aws_security_group.master.id, src = aws_security_group.bootstrap.id }
+    worker_from_master    = { sg = aws_security_group.worker.id, src = aws_security_group.master.id }
+    worker_from_worker    = { sg = aws_security_group.worker.id, src = aws_security_group.worker.id }
+  }
+
+  security_group_id            = each.value.sg
+  referenced_security_group_id = each.value.src
+  ip_protocol                  = "tcp"
+  from_port                    = 10250
+  to_port                      = 10250
+  description                  = "kubelet API (${each.key})"
+}

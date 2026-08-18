@@ -1,0 +1,7 @@
+# Copy to <account-alias>.backend.hcl. The bucket named here must live
+# INSIDE that same client's AWS account (state is never centralized across
+# clients) — created by scripts/bootstrap-state.sh, added in Phase 2.
+
+bucket = "REPLACE-ocp-terraform-state"
+key    = "ocp/terraform.tfstate"
+region = "il-central-1"

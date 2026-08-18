@@ -1,0 +1,25 @@
+# Terraform local cache / state (never commit)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored — commit it for reproducible provider versions.
+
+# Preflight run artifacts
+preflight/reports/
+
+# Secrets / generated installer output — never commit these
+.ignition/
+*pull-secret*
+secrets.auto.tfvars
+
+# Per-client infra identifiers — commit only the .sample templates
+accounts/*.tfvars
+!accounts/example.tfvars.sample
+accounts/backend/*.backend.hcl
+!accounts/backend/example.backend.hcl.sample
