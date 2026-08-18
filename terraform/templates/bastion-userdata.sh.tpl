@@ -53,12 +53,6 @@ docker run -d --name haproxy --network host --restart always --user root \
   haproxytech/haproxy-alpine:latest \
   haproxy -W -f /usr/local/etc/haproxy/haproxy.cfg
 
-# ---- Ignition HTTP server: serves whatever sync-config.sh has pulled from S3 ----
-
-docker run -d --name ignition-http --network host --restart always \
-  -v /var/ignition-serve:/www:ro \
-  busybox:latest busybox httpd -f -p 8080 -h /www
-
 # ---- self-heal: poll S3 for ignition/haproxy-config changes, reload on change ----
 # Belt-and-suspenders alongside the haproxy-config module's SSM-driven push --
 # covers the case where an SSM push itself is lost to a transient network
@@ -69,6 +63,25 @@ cat > /usr/local/bin/sync-config.sh <<'SYNC_EOF'
 set -euo pipefail
 
 aws s3 sync s3://${ignition_bucket_name}/ignition/ /var/ignition-serve/ignition/ --region ${aws_region} --only-show-errors
+
+# Start the ignition HTTP server only once real files are on disk, never
+# before. This ordering is load-bearing, not tidiness: Ignition retries a
+# refused connection but treats HTTP 404 as FATAL, so a server that is up
+# while /var/ignition-serve/ignition/ is still empty kills every node that
+# happens to boot in that window -- confirmed for real, all 4 nodes dead in
+# emergency mode with "failed to fetch config: resource not found" after the
+# bastion was replaced in the same apply that created them. Leaving the port
+# closed until the files land turns that window into connection-refused,
+# which Ignition survives. Owned here rather than in the day-0 script above
+# so a transient S3 failure at boot self-heals on the next timer tick
+# instead of stranding the server permanently.
+if [ -n "$(ls -A /var/ignition-serve/ignition/ 2>/dev/null)" ] &&
+   ! docker ps --format '{{.Names}}' | grep -qx ignition-http; then
+  docker rm -f ignition-http >/dev/null 2>&1 || true
+  docker run -d --name ignition-http --network host --restart always \
+    -v /var/ignition-serve:/www:ro \
+    busybox:latest busybox httpd -f -p 8080 -h /www
+fi
 
 NEW_ETAG=$(aws s3api head-object --bucket ${ignition_bucket_name} --key haproxy/haproxy.cfg --region ${aws_region} --query ETag --output text 2>/dev/null || echo "")
 CUR_ETAG=""
@@ -82,6 +95,8 @@ if [ -n "$NEW_ETAG" ] && [ "$NEW_ETAG" != "$CUR_ETAG" ]; then
 fi
 SYNC_EOF
 chmod +x /usr/local/bin/sync-config.sh
+
+/usr/local/bin/sync-config.sh || true
 
 cat > /etc/systemd/system/sync-config.service <<'SVC_EOF'
 [Unit]

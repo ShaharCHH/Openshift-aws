@@ -49,7 +49,12 @@ three containers:
   install would use.
 - **A static HTTP server on port 8080** — serves ignition files to cluster
   nodes. See "How Ignition works" below for why this exists and what it
-  replaced.
+  replaced. It is started by `sync-config.sh` *after* the first successful
+  S3 pull, never by the day-0 userdata directly: Ignition retries a refused
+  connection but treats HTTP 404 as fatal, so a server listening on an empty
+  directory kills every node booting in that window. Keeping the port closed
+  until the files are on disk turns that window into connection-refused,
+  which nodes survive.
 
 The bastion is reached only via AWS SSM Session Manager (port forwarding) —
 no SSH key, no public IP, no bastion host in the traditional sense.
