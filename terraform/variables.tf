@@ -63,6 +63,24 @@ variable "bastion_instance_type" {
   default = "t3.medium"
 }
 
+variable "bastion_ami_id" {
+  type        = string
+  default     = null
+  description = <<-EOT
+    Pins the bastion's Amazon Linux 2023 AMI. Leave null to fall back to
+    modules/bastion's `most_recent = true` data source lookup.
+
+    Worth pinning: leaving it to most_recent means Amazon's release schedule
+    decides when the bastion gets replaced, not you. That happened for real --
+    a new AL2023 image published overnight flipped the data source, folding a
+    bastion replacement into an apply that also created cluster nodes. The
+    fresh bastion was not yet serving ignition when they booted, and all four
+    nodes died in dracut emergency mode. The ordering fix in the bastion's
+    userdata makes that survivable now, but a replacement you did not ask for
+    is still worth not having.
+  EOT
+}
+
 variable "master_instance_type" {
   type    = string
   default = "m5.xlarge" # Red Hat's documented minimum for control-plane nodes

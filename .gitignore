@@ -23,3 +23,6 @@ accounts/*.tfvars
 !accounts/example.tfvars.sample
 accounts/backend/*.backend.hcl
 !accounts/backend/example.backend.hcl.sample
+
+# macOS
+.DS_Store

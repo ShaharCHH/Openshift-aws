@@ -4,6 +4,14 @@
 # docs/runbook.md's Phase 6.
 
 locals {
+  # Same real-root network keyfile the masters get. Bootstrap is short-lived and
+  # may never reboot, but it cannot be covered the way masters could be (via a
+  # MachineConfig) -- it *is* the Machine Config Server, so it never fetches from
+  # one. Delivering it here keeps both roles on a single mechanism.
+  node_network_keyfile = templatefile("${path.module}/../../templates/node-network.nmconnection.tpl", {
+    bastion_private_ip = var.bastion_private_ip
+  })
+
   pointer_ignition = jsonencode({
     ignition = {
       version = "3.2.0"
@@ -12,6 +20,18 @@ locals {
           { source = "http://${var.bastion_private_ip}:8080/ignition/bootstrap.ign" }
         ]
       }
+    }
+    storage = {
+      files = [
+        {
+          path      = "/etc/NetworkManager/system-connections/default-dhcp.nmconnection"
+          mode      = 384 # 0600 -- NetworkManager silently ignores world-readable keyfiles
+          overwrite = true
+          contents = {
+            source = "data:text/plain;base64,${base64encode(local.node_network_keyfile)}"
+          }
+        }
+      ]
     }
   })
 }

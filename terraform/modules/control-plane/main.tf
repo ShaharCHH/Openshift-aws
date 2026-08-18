@@ -8,6 +8,13 @@
 # manage for something this small.
 
 locals {
+  # Written to the real root so the node still has networking after a reboot --
+  # the AMI's kernel arguments only cover the initramfs. See the template's own
+  # comment, and docs/architecture.md, for the failure this prevents.
+  node_network_keyfile = templatefile("${path.module}/../../templates/node-network.nmconnection.tpl", {
+    bastion_private_ip = var.bastion_private_ip
+  })
+
   pointer_ignition = jsonencode({
     ignition = {
       version = "3.2.0"
@@ -23,6 +30,18 @@ locals {
           ]
         }
       }
+    }
+    storage = {
+      files = [
+        {
+          path      = "/etc/NetworkManager/system-connections/default-dhcp.nmconnection"
+          mode      = 384 # 0600 -- NetworkManager silently ignores world-readable keyfiles
+          overwrite = true
+          contents = {
+            source = "data:text/plain;base64,${base64encode(local.node_network_keyfile)}"
+          }
+        }
+      ]
     }
   })
 }

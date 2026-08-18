@@ -198,6 +198,22 @@ with a validate-then-`SIGHUP` reload. That `local-exec` waits on the SSM
 command, so a failed reload fails the apply rather than leaving stale config
 running.
 
+### Gate: prove the AMI survives a reboot
+
+Do this **before** launching a cluster on an AMI you have not already reboot-tested.
+It takes about five minutes; skipping it costs about two hours.
+
+```
+./scripts/ami-build/verify-ami-reboot.sh -a horizon --ami <ami-id>
+```
+
+It boots one instance from the AMI (bastion must be up — it is the probe origin),
+proves port 22 reachable, reboots, and proves it reachable again. **The second
+check is the whole point.** A node that only works on its first boot looks
+completely healthy right up until the MCO applies its first rendered config and
+reboots every master at once — see `docs/architecture.md`, "Node networking is
+configured twice".
+
 ## Phase 5 — Wait for bootstrap
 
 Open an SSM port-forward to the bastion (no wrapper script exists yet):
@@ -334,6 +350,7 @@ patience has proven necessary.
 | `x509: certificate signed by unknown authority` retrying every 5s | `mcs_ca_data_url` is stale — regenerate ignition and re-extract |
 | `GET error: ... EOF` on port 22623 | DNS and TCP are fine; HAProxy's MCS backend list is empty. Normal if no bootstrap is running |
 | Nodes in emergency mode ~90s after launch, `failed to fetch config: resource not found` | The bastion's ignition server answered 404 — it was replaced in the same apply that created the nodes, so it was still empty when they booted. EC2 status checks read `ok`/`ok` throughout. Replace the nodes once the bastion is serving; check `ls /var/ignition-serve/ignition/` on it first |
+| Every node goes `NotReady` at once, `Kubelet stopped posting node status`, all within seconds of each other | The nodes rebooted (almost certainly an MCO rollout) and came back with no IP. Check the console banner for `ens5:` with nothing after it. The kernel args only configure the initramfs; the real root needs the NetworkManager keyfile from `templates/node-network.nmconnection.tpl`. Note `:6443` can stay open through this — CRI-O keeps existing containers running even with kubelet down, so an open port is not proof of a healthy node |
 | Nodes stay `NotReady` forever, `aws-cloud-controller-manager` in CrashLoopBackOff | Missing `cluster_infra_id` tag, or a missing EC2 permission on the master role. Read the pod's actual logs — it names the exact denied action |
 | `oc` reports `TLS handshake timeout` while `wait-for` runs fine | SSM tunnel contention. Run `oc` from the bastion |
 

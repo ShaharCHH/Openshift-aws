@@ -39,6 +39,7 @@ module "bastion" {
   instance_profile_name = module.iam.instance_profile_names["bastion"]
   bastion_role_name     = module.iam.role_names["bastion"]
   instance_type         = var.bastion_instance_type
+  ami_id                = var.bastion_ami_id
   cluster_name          = var.cluster_name
   base_domain           = var.base_domain
   upstream_dns          = local.upstream_dns

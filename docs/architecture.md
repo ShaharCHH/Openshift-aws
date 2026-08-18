@@ -74,6 +74,57 @@ connections, no instance churn. The `local-exec` blocks on
 `aws ssm wait command-executed`, so a failed reload fails the `terraform
 apply` itself instead of silently leaving stale config running.
 
+## Node networking is configured twice, in two different places
+
+This looks redundant and isn't. A cluster node needs working networking at two
+moments that share nothing:
+
+**In the initramfs**, before a root filesystem exists, so Ignition can resolve
+`api-int.<cluster>.<base_domain>` for its `config.merge` fetch to the Machine
+Config Server. Nothing on disk exists yet, so the only vehicle is a kernel
+argument: `ip=dhcp nameserver=<bastion-ip>`, patched into the AMI's GRUB entry by
+`scripts/ami-build/build-custom-ami.sh`. (`nameserver=` without `ip=dhcp` hangs
+dracut before any console output — always pair them.)
+
+**On the real root**, for every boot from then on. This is the part that is easy
+to miss, because the first boot appears to work without it: the initrd hands its
+connection over to NetworkManager, and the node comes up fine. But on RHEL 9,
+having network configuration on the kernel command line changes how NetworkManager
+behaves on the real root, and with no persistent connection profile on disk, every
+**subsequent** boot comes up with the interface unconfigured.
+
+That was found the expensive way. All three masters rebooted together when the MCO
+applied its first rendered config, and came back with no address:
+
+```
+ens5:
+Ignition: ran on 2026/08/18 09:17:45 UTC (at least 2 boots ago)
+```
+
+All three kubelets stopped posting within two seconds of each other. AWS still held
+every private IP on an attached, in-use ENI — so the VPC would have handed out the
+leases; the failure was entirely inside the guest. Since the MCO reboots nodes as
+routine maintenance, a cluster missing this second half cannot survive its own
+first config rollout, and every bring-up before that point looks perfectly healthy.
+
+The fix is `terraform/templates/node-network.nmconnection.tpl`, a NetworkManager
+keyfile delivered through the **wrapper ignition** (`modules/control-plane` and
+`modules/bootstrap`, mode 0600 — NM ignores world-readable keyfiles). It is
+deliberately not baked into the AMI: `build-custom-ami.sh` only ever mounts the
+`boot` partition, and writing into RHCOS's ostree `/etc` means new code plus merge
+semantics that can silently discard a raw file drop. It is deliberately not a
+MachineConfig either: that would work for masters but not for bootstrap, which *is*
+the Machine Config Server and never fetches from one.
+
+Note this is the opposite of the constraint described below under "The mechanism,
+and why it changed" — a MachineConfig cannot fix the *initramfs* problem, because
+it arrives behind the very fetch it would unblock. It can, however, fix the real
+root, which is why the two halves need two different mechanisms.
+
+`scripts/ami-build/verify-ami-reboot.sh` is the acceptance gate: it boots an
+instance from an AMI, proves it reachable, reboots it, and proves it reachable
+again. First-boot success alone proves nothing.
+
 ## How Ignition works (full detail, not just the summary)
 
 Ignition is RHCOS's first-boot provisioning system — it runs inside the
