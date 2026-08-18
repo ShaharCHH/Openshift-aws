@@ -241,3 +241,69 @@ resource "aws_vpc_security_group_ingress_rule" "kubelet" {
   to_port                      = 10250
   description                  = "kubelet API (${each.key})"
 }
+
+# ---- pod network: OVN-Kubernetes node-to-node ----
+#
+# OVN encapsulates every pod-to-pod packet that crosses a node boundary in
+# Geneve (UDP 6081). Without that one rule, pods on the same node talk fine and
+# pods on different nodes cannot reach each other at all -- and because the
+# cluster is *partly* functional, the symptoms surface far from the cause:
+# openshift-apiserver's aggregated APIs return 503, so route.openshift.io stops
+# answering, so the ingress routers fail their has-synced probe and restart in a
+# loop, so authentication and console go Degraded complaining about routes. None
+# of those messages mention the network.
+#
+# Confirmed directly rather than inferred, from a node with a Ready DNS pod on
+# every node:
+#   SAME node  -> pod 10.129.0.25:5353  OPEN
+#   OTHER node -> pod 10.130.0.50:5353  BLOCKED
+#   OTHER node -> pod 10.128.0.21:5353  BLOCKED
+#
+# The other two ranges come from Red Hat's documented UPI firewall requirements
+# and are added here rather than waiting for each to announce itself the way
+# Geneve did: 9000-9999 for host-level services (node-exporter and friends, which
+# Prometheus scrapes across nodes) and 30000-32767 for NodePort. Every one of
+# these is scoped to this deployment's own security groups -- nothing is opened
+# to a CIDR.
+locals {
+  pod_network_ports = {
+    geneve       = { proto = "udp", from = 6081, to = 6081 }
+    host_svc_tcp = { proto = "tcp", from = 9000, to = 9999 }
+    host_svc_udp = { proto = "udp", from = 9000, to = 9999 }
+    nodeport_tcp = { proto = "tcp", from = 30000, to = 32767 }
+    nodeport_udp = { proto = "udp", from = 30000, to = 32767 }
+  }
+
+  # Bootstrap is included: it joins the pod network too while it is alive.
+  pod_network_pairs = {
+    master_from_master    = { sg = aws_security_group.master.id, src = aws_security_group.master.id }
+    master_from_worker    = { sg = aws_security_group.master.id, src = aws_security_group.worker.id }
+    master_from_bootstrap = { sg = aws_security_group.master.id, src = aws_security_group.bootstrap.id }
+    worker_from_master    = { sg = aws_security_group.worker.id, src = aws_security_group.master.id }
+    worker_from_worker    = { sg = aws_security_group.worker.id, src = aws_security_group.worker.id }
+    bootstrap_from_master = { sg = aws_security_group.bootstrap.id, src = aws_security_group.master.id }
+  }
+
+  pod_network_rules = {
+    for pair in setproduct(keys(local.pod_network_ports), keys(local.pod_network_pairs)) :
+    "${pair[0]}-${pair[1]}" => {
+      proto = local.pod_network_ports[pair[0]].proto
+      from  = local.pod_network_ports[pair[0]].from
+      to    = local.pod_network_ports[pair[0]].to
+      sg    = local.pod_network_pairs[pair[1]].sg
+      src   = local.pod_network_pairs[pair[1]].src
+      label = pair[0]
+    }
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "pod_network" {
+  for_each = local.pod_network_rules
+
+  security_group_id            = each.value.sg
+  referenced_security_group_id = each.value.src
+  ip_protocol                  = each.value.proto
+  from_port                    = each.value.from
+  to_port                      = each.value.to
+  description                  = "pod network ${each.value.label} (${each.key})"
+}
