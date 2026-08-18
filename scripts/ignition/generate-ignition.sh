@@ -49,6 +49,38 @@ command -v openshift-install >/dev/null 2>&1 || {
 echo "Generating manifests..." >&2
 openshift-install create manifests --dir "$dir"
 
+# Pin the default IngressController to HostNetwork before the manifests are
+# consumed. On AWS the installer's default is a LoadBalancerService, which
+# makes the ingress operator try to provision a Classic ELB -- an operation
+# this account's SCP blocks outright (docs/scp-blockers.md row 4), and the
+# entire reason HAProxy runs on the bastion. Left at the default, ingress
+# never comes up: the operator reports SyncLoadBalancerFailed forever, the
+# router Service sits at EXTERNAL-IP <pending>, and the ingress
+# clusteroperator stays Available=False, which alone is enough to fail
+# `wait-for install-complete`.
+#
+# HostNetwork makes the routers bind each node's own :80/:443 instead, which
+# is exactly what terraform's haproxy_config ingress_backends already point
+# at (master IPs in this compact topology). The matching security-group
+# rules live in terraform/modules/security-groups (master_from_bastion).
+#
+# This has to happen here, between `create manifests` and `create
+# ignition-configs`: it is the last point the manifests are editable, and
+# endpointPublishingStrategy is immutable once the cluster is up -- fixing
+# it later means deleting and recreating the IngressController by hand.
+echo "Pinning default IngressController to HostNetwork..." >&2
+cat >"$dir/manifests/cluster-ingress-default-ingresscontroller.yaml" <<'INGRESS_EOF'
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: default
+  namespace: openshift-ingress-operator
+spec:
+  replicas: 3
+  endpointPublishingStrategy:
+    type: HostNetwork
+INGRESS_EOF
+
 # Masters resolve their real MachineConfig from https://api-int.<cluster
 # domain>:22623 on first boot -- a name only the bastion's CoreDNS can
 # answer. That fetch happens inside Ignition's own config.merge stage, which

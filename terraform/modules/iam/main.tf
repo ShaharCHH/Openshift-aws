@@ -49,18 +49,40 @@ resource "aws_iam_role_policy_attachment" "ssm" {
 # confirmed-needed action, not the default installer's broad ec2:*
 # wildcard -- broader cloud-controller-manager features (ELB, EBS
 # provisioning) aren't exercised by this design (own HAProxy for ingress,
-# no LoadBalancer-type Services) and can be added the same way, backed by a
-# real error, if something else turns out to need them.
+# no LoadBalancer-type Services) and are deliberately still absent.
 data "aws_iam_policy_document" "master_cloud_provider" {
   statement {
-    # Confirmed for real, one at a time, each from an actual
-    # UnauthorizedOperation in aws-cloud-controller-manager's own logs
-    # rather than copied from the installer's broad default ec2:* policy:
+    # Read-only EC2 describes for the in-cluster cloud provider. The first
+    # three were each found the hard way, one crash-loop cycle at a time,
+    # from a real UnauthorizedOperation in the operator's own logs:
     # DescribeInstances (node identification), DescribeAvailabilityZones
-    # (node_controller's per-node metadata sync).
+    # (node_controller's per-node metadata sync), DescribeSubnets (the
+    # service controller's subnet lookup).
+    #
+    # The rest are granted pre-emptively rather than continuing that
+    # pattern. Three sequential discoveries, each costing a restart cycle to
+    # surface, is enough evidence that the cloud provider's read path is
+    # wider than any single error reveals. These are all non-mutating
+    # describes, so granting them adds no ability to change anything --
+    # unlike the installer's default ec2:* wildcard, which would also carry
+    # create/delete and is still deliberately not used here.
+    #
+    # Note what is still NOT here: anything under elasticloadbalancing:*.
+    # That is not an oversight waiting on the next error -- ELB creation is
+    # SCP-blocked outright (docs/scp-blockers.md row 4), which is why
+    # ingress runs through HAProxy on the bastion with the default
+    # IngressController pinned to HostNetwork (see
+    # scripts/ignition/generate-ignition.sh). Anything here asking for a
+    # LoadBalancer-type Service is a misconfiguration to fix at its source,
+    # not a missing permission to grant.
     actions = [
       "ec2:DescribeInstances",
       "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeRegions",
+      "ec2:DescribeRouteTables",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeVpcs",
     ]
     resources = ["*"]
   }

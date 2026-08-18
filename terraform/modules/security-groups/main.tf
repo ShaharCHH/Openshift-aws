@@ -108,8 +108,17 @@ resource "aws_vpc_security_group_ingress_rule" "bastion" {
 
 # ---- HAProxy on the bastion reaching real backends ----
 
+# http/https are here, not only on the worker SG below, because this is a
+# compact topology: masters are schedulable and run the ingress routers
+# themselves, so HAProxy's ingress_backends point at master IPs (see
+# main.tf's haproxy_config block). Those routers bind the node's own :80 and
+# :443 because the default IngressController is pinned to HostNetwork rather
+# than a LoadBalancer Service -- ELB creation being SCP-blocked is the whole
+# reason HAProxy exists here. Without these two rules HAProxy is pointed at
+# ports it cannot reach, and ingress fails with no error on the router side
+# at all.
 resource "aws_vpc_security_group_ingress_rule" "master_from_bastion" {
-  for_each = { api = 6443, mcs = 22623 }
+  for_each = { api = 6443, mcs = 22623, http = 80, https = 443 }
 
   security_group_id            = aws_security_group.master.id
   referenced_security_group_id = aws_security_group.bastion.id
@@ -184,6 +193,36 @@ resource "aws_vpc_security_group_ingress_rule" "etcd" {
   from_port                    = 2379
   to_port                      = 2380
   description                  = "etcd peer + client"
+}
+
+# etcd's first member runs on the BOOTSTRAP node, not a master: masters join
+# that cluster as peers and only take it over once bootstrap is torn down.
+# So etcd traffic has to flow both ways between bootstrap and the masters,
+# and master-to-master alone (above) is not enough during bring-up.
+#
+# Confirmed for real, and it is silent in a way worth knowing: the etcd
+# static pod on a master starts with an EMPTY ETCDCTL_ENDPOINTS (the
+# operator could not populate it, having never reached the bootstrap etcd),
+# falls back to 127.0.0.1:2379 where nothing is listening, and dies with
+# "failed to create etcd client: context deadline exceeded". Nothing in that
+# message points at bootstrap or at a firewall -- the only way to see it is
+# to test the path directly:
+#   master -> bootstrap:2379  BLOCKED
+#   master -> bootstrap:2380  BLOCKED
+# With etcd down there is no kube-apiserver, and every other operator's
+# failure is downstream noise.
+resource "aws_vpc_security_group_ingress_rule" "etcd_bootstrap" {
+  for_each = {
+    bootstrap_from_master = { sg = aws_security_group.bootstrap.id, src = aws_security_group.master.id }
+    master_from_bootstrap = { sg = aws_security_group.master.id, src = aws_security_group.bootstrap.id }
+  }
+
+  security_group_id            = each.value.sg
+  referenced_security_group_id = each.value.src
+  ip_protocol                  = "tcp"
+  from_port                    = 2379
+  to_port                      = 2380
+  description                  = "etcd peer + client (${each.key})"
 }
 
 resource "aws_vpc_security_group_ingress_rule" "kubelet" {
