@@ -77,6 +77,21 @@ module "bootstrap" {
   tags                  = local.cluster_owned_tag
 }
 
+module "efs" {
+  source = "./modules/efs"
+
+  name_prefix = local.name_prefix
+  vpc_id      = module.vpc.vpc_id
+  subnet_ids  = module.vpc.private_subnet_ids
+
+  # Masters carry workloads too in this compact topology, so they mount it as
+  # well as any future workers.
+  client_security_group_ids = {
+    master = module.security_groups.master_sg_id
+    worker = module.security_groups.worker_sg_id
+  }
+}
+
 module "haproxy_config" {
   source = "./modules/haproxy-config"
 

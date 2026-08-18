@@ -1,0 +1,191 @@
+# Dynamic storage for a cluster that cannot hold a cloud credential.
+#
+# WHY NOT A CSI DRIVER: install-config sets credentialsMode: Manual (an SSO
+# session cannot supply long-lived keys), so the Cloud Credential Operator mints
+# nothing, and both ways of supplying credentials by hand are SCP-denied --
+# probed for real: iam:CreateUser (p-cf140vwn) and
+# iam:CreateOpenIDConnectProvider (p-77bk5ceo). Borrowing the node's instance
+# profile does not work either: the EBS CSI controller runs on the pod network,
+# and OVN-Kubernetes does not forward pod traffic to 169.254.169.254.
+#
+# EFS speaks NFSv4.1, so nothing here ever calls AWS. The filesystem is created
+# by terraform/modules/efs; this provisioner just makes a subdirectory per PVC.
+#
+# Two OpenShift-specific choices worth understanding before editing:
+#
+#  1. The provisioner mounts the export through a PVC, not through a pod-level
+#     `nfs:` volume. OpenShift's restricted-v2 SCC does not permit the `nfs`
+#     volume type, so a direct nfs volume would need a privileged SCC. Going via
+#     a PersistentVolume lets kubelet do the mount and keeps this pod under the
+#     default restricted SCC.
+#
+#  2. The export root is /openshift, pre-created mode 1777, not / (which EFS
+#     leaves as root:root 755). Pods here run as an arbitrary non-root UID, so a
+#     world-writable, sticky parent is what lets the provisioner create
+#     subdirectories at all.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nfs-provisioner
+---
+# Static PV for the export root itself. Only the provisioner binds this; the
+# per-workload PVs it creates are separate objects.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: efs-provisioner-root
+spec:
+  capacity:
+    storage: 1Ti # EFS is elastic; this number is bookkeeping, not a limit
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: [nfsvers=4.1, rsize=1048576, wsize=1048576, hard, timeo=600, retrans=2]
+  nfs:
+    server: EFS_DNS_NAME
+    path: /openshift
+  claimRef:
+    namespace: nfs-provisioner
+    name: efs-provisioner-root
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-provisioner-root
+  namespace: nfs-provisioner
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: efs-provisioner-root
+  resources:
+    requests:
+      storage: 1Ti
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-provisioner
+  namespace: nfs-provisioner
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nfs-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, update]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nfs-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-provisioner
+    namespace: nfs-provisioner
+roleRef:
+  kind: ClusterRole
+  name: nfs-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nfs-provisioner
+  namespace: nfs-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [endpoints]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nfs-provisioner
+  namespace: nfs-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-provisioner
+    namespace: nfs-provisioner
+roleRef:
+  kind: Role
+  name: nfs-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-provisioner
+  namespace: nfs-provisioner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single writer to the export root; never two at once
+  selector:
+    matchLabels:
+      app: nfs-provisioner
+  template:
+    metadata:
+      labels:
+        app: nfs-provisioner
+    spec:
+      serviceAccountName: nfs-provisioner
+      containers:
+        - name: nfs-provisioner
+          image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+          volumeMounts:
+            - name: export-root
+              mountPath: /persistentvolumes
+          env:
+            - name: PROVISIONER_NAME
+              value: openshift.local/efs-nfs
+            # Only used to stamp the PVs this provisioner creates; the mount
+            # itself comes from the PVC above.
+            - name: NFS_SERVER
+              value: EFS_DNS_NAME
+            - name: NFS_PATH
+              value: /openshift
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: export-root
+          persistentVolumeClaim:
+            claimName: efs-provisioner-root
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-nfs
+  annotations:
+    # The cluster has no other working provisioner, so this is the default.
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: openshift.local/efs-nfs
+parameters:
+  # Keep data on delete until an operator decides otherwise -- the alternative
+  # silently discards a PVC's contents, and EFS storage is cheap.
+  onDelete: retain
+  pathPattern: "${.PVC.namespace}-${.PVC.name}"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

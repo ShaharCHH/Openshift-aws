@@ -42,3 +42,12 @@ output "install_config_inputs" {
     base_domain        = var.base_domain
   }
 }
+
+# Consumed when deploying nfs-subdir-external-provisioner -- see docs/runbook.md.
+output "efs_dns_name" {
+  value = module.efs.dns_name
+}
+
+output "efs_mount_target_ips" {
+  value = module.efs.mount_target_ips
+}

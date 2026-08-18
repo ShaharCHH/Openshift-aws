@@ -64,6 +64,17 @@ resource "aws_instance" "master" {
 
   metadata_options {
     http_tokens = "required" # IMDSv2 only
+
+    # Pinned at 1, and raising it will not do what it looks like it should.
+    # A hop limit of 2 is the usual way to let non-host-network pods reach
+    # IMDS, and it was tried here so a CSI driver could borrow the node's
+    # instance profile. It does not work: OVN-Kubernetes does not forward pod
+    # traffic to 169.254.169.254 at all. Verified with the limit at 2 and no
+    # firewall rule on the node -- IMDS answered from the host and returned
+    # nothing from a pod. Left at 1 so the setting matches reality rather than
+    # implying an access path that does not exist. Storage instead goes through
+    # EFS, which needs no cloud credential (see modules/efs).
+    http_put_response_hop_limit = 1
   }
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-master-${count.index}" })
