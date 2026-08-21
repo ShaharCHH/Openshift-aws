@@ -216,7 +216,8 @@ configured twice".
 
 ## Phase 5 — Wait for bootstrap
 
-Open an SSM port-forward to the bastion (no wrapper script exists yet):
+Open an SSM port-forward to the bastion. `./scripts/tunnel.sh -a horizon` does
+this and reconnects when the session times out; the underlying command is:
 
 ```
 aws ssm start-session --target $(terraform output -raw bastion_instance_id) \
@@ -227,8 +228,15 @@ aws ssm start-session --target $(terraform output -raw bastion_instance_id) \
 Point the cluster's API name at that tunnel, in `/etc/hosts` on your machine:
 
 ```
-127.0.0.1  api.horizon.ocp.internal api-int.horizon.ocp.internal
+127.0.0.1  api.horizon.ocp.internal
 ```
+
+`api.` only — **not** `api-int`. Earlier versions of this file listed both, and
+the internal name does nothing here: the installer's kubeconfig points at
+`https://api.<cluster>.<base_domain>:6443`, and `api-int` is what *cluster
+nodes* resolve (the MCS fetch on 22623), through the bastion's CoreDNS and its
+own `/etc/hosts` — both written by the bastion userdata, neither involving your
+machine.
 
 Then:
 
@@ -246,7 +254,9 @@ tunnel handles one heavy consumer well and two badly; you'll get
 `TLS handshake timeout` on the `oc` side while `wait-for` keeps working, which
 reads like a cluster problem and isn't. Run `oc` from the bastion instead —
 it reaches the API directly over the VPC network with no tunnel involved.
-The bastion needs its own `/etc/hosts` entry for the API names, same as above.
+Nothing to set up there: the bastion writes its own `/etc/hosts` entry for both
+API names at boot (`templates/bastion-userdata.sh.tpl`), pointing them at
+itself, and installs `oc` in the same pass.
 
 ## Phase 6 — Drop bootstrap
 
@@ -274,9 +284,45 @@ oc get clusteroperators
 
 Every operator reporting `Available=True` is the finish line. Console
 credentials are in `.ignition/horizon/auth/kubeadmin-password`; reaching the
-console in a browser needs a tunnel on 443 to
-`console-openshift-console.apps.horizon.ocp.internal` plus the matching
-`/etc/hosts` entry.
+console in a browser needs a tunnel on 443:
+
+```
+sudo -E ./scripts/tunnel.sh -a horizon --console
+```
+
+Local 443 is a privileged port, hence `sudo` — and `-E` specifically, or the
+aws CLI loses `AWS_PROFILE` and your SSO cache and fails as if the credentials
+were bad. It has to be 443 and not some convenient high port, because the
+console redirects to the OAuth server by canonical hostname with no port in it.
+
+**The `-E` that makes this work also has a sting, and it lands days later.**
+Preserving `HOME` means the aws CLI running as root still reads *and writes*
+your `~/.aws` — so any SSO token it refreshes is left there owned by `root`.
+Nothing fails at the time. What fails is your next ordinary, non-sudo login:
+
+```
+aws: [ERROR]: [Errno 13] Permission denied:
+  '/Users/<you>/.aws/sso/cache/706aa66a...json'
+```
+
+That filename is a hash of the start URL, so it points nowhere useful. Hit for
+real on 21 Aug 2026, from a root-owned token written on 19 Aug. `tunnel.sh`
+now hands ownership back on exit, and warns if it finds leftovers from an
+earlier run. To clear them by hand — no sudo needed, the directories are yours:
+
+```
+find ~/.aws -user 0 -delete
+```
+
+**That redirect is also why two `/etc/hosts` entries are needed, not one.**
+CoreDNS answers `*.apps` with a wildcard; `/etc/hosts` has no such thing, so
+the console loads and then login fails on an unresolvable name:
+
+```
+127.0.0.1  console-openshift-console.apps.horizon.ocp.internal oauth-openshift.apps.horizon.ocp.internal
+```
+
+`tunnel.sh` checks for both and prints the line to add if either is missing.
 
 ---
 
@@ -486,6 +532,23 @@ able to act on control-plane machines it currently considers unavailable.
 
 ## Day-2 operations
 
+**Reaching the cluster at all** — there is no public endpoint, so every `oc`
+call and every browser tab goes through an SSM port-forward to the bastion:
+
+```
+./scripts/tunnel.sh -a horizon              # 6443, for oc/kubectl
+sudo -E ./scripts/tunnel.sh -a horizon --console   # 443, for the web console
+```
+
+One session forwards one port, so the console tunnel is a second terminal. The
+script reads `accounts/<alias>.tfvars` directly — no terraform state, any
+working directory — checks the `/etc/hosts` entries the tunnel needs before
+binding anything, and reconnects when the session hits its idle timeout
+(see the Troubleshooting row below for why that matters). Ctrl-C closes it.
+
+Heavy or long-running work is still better done from the bastion itself, which
+reaches the API over the VPC with no tunnel in the path.
+
 **Pausing between work sessions** — stops instances, pausing compute
 billing. EBS volumes bill regardless, so this is for gaps of days, not
 weeks; for anything longer, destroy and rebuild:
@@ -560,7 +623,8 @@ patience has proven necessary.
 | `ingress` stuck `Available=False`, router Service at `EXTERNAL-IP <pending>`, operator logging `SyncLoadBalancerFailed` | The default IngressController was not pinned to `HostNetwork` before `create ignition-configs`. It is trying to build an SCP-denied ELB. `endpointPublishingStrategy` is immutable once the object exists, so this cannot be patched — the IngressController has to be deleted and recreated. Cheaper to regenerate ignition and reinstall |
 | Objects wedged in `Terminating` under `openshift-ingress` | Same cause as above: the load-balancer Service holds a finalizer that can never complete, because the ELB it refers to was never created |
 | A PVC binds to an unexpected class, or sits `Pending` with no provisioner named | Two StorageClasses are both marked default — see Post-install cleanup. `oc get sc` shows more than one `(default)` |
-| `oc` suddenly fails with `connection refused` to `127.0.0.1:6443` after a quiet spell | The SSM port-forward session timed out: `Your session timed out due to inactivity and has been terminated`. It closes cleanly (exit 0), so nothing looks broken until the next command. Restart the port-forward; long-running work through the tunnel should keep it busy or expect to reconnect |
+| `oc` suddenly fails with `connection refused` to `127.0.0.1:6443` after a quiet spell | The SSM port-forward session timed out: `Your session timed out due to inactivity and has been terminated`. It closes cleanly (exit 0), so nothing looks broken until the next command. Restart the port-forward; long-running work through the tunnel should keep it busy or expect to reconnect. `./scripts/tunnel.sh` rides through this — it reconnects and logs each reconnect, so the tunnel dying stops being invisible |
+| `aws sso login` fails with `[Errno 13] Permission denied` on a hash-named file under `~/.aws/sso/cache/` | An earlier `sudo -E` run (the console tunnel on 443) left a root-owned token in your own `~/.aws`. The filename is a hash of the start URL and names nothing actionable. `find ~/.aws -user 0 -delete`, then log in again — no sudo needed, the directories are yours. `tunnel.sh` restores ownership on exit now, and warns about leftovers |
 
 When a pod is in `CrashLoopBackOff` and you've just fixed its cause,
 `oc delete pod -l <selector>` skips the growing backoff timer instead of
