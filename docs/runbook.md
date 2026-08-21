@@ -287,13 +287,30 @@ credentials are in `.ignition/horizon/auth/kubeadmin-password`; reaching the
 console in a browser needs a tunnel on 443:
 
 ```
-sudo -E ./scripts/tunnel.sh -a horizon --console
+sudo -E ./scripts/tunnel.sh -a horizon --console \
+  --profile Workload-Admin-PS-342831714456
 ```
 
-Local 443 is a privileged port, hence `sudo` — and `-E` specifically, or the
-aws CLI loses `AWS_PROFILE` and your SSO cache and fails as if the credentials
-were bad. It has to be 443 and not some convenient high port, because the
-console redirects to the OAuth server by canonical hostname with no port in it.
+Use `--all` instead of `--console` to get the API tunnel alongside it from the
+same terminal — the flags combine, so `--api --console` is the same thing.
+
+Local 443 is a privileged port, hence `sudo`. It has to be 443 and not some
+convenient high port, because the console redirects to the OAuth server by
+canonical hostname with no port in it.
+
+**Name the profile explicitly — do not trust `sudo` to carry it.** `-E` is
+still worth passing (it keeps `HOME` pointing at your home, so the CLI can find
+`~/.aws` at all), but it does *not* reliably deliver `AWS_PROFILE`: the sudoers
+policy can strip it, and a terminal opened just to run the sudo command never
+exported it in the first place. When it goes missing the aws CLI silently uses
+the `[default]` profile and reports **that** profile's expiry:
+
+```
+aws: [ERROR]: Your session has expired. Please reauthenticate using 'aws login'.
+```
+
+Which is maddening, because you just logged in — the expired session belongs to
+a profile you never meant to use. Hit for real on 21 Aug 2026.
 
 **The `-E` that makes this work also has a sting, and it lands days later.**
 Preserving `HOME` means the aws CLI running as root still reads *and writes*
@@ -536,15 +553,27 @@ able to act on control-plane machines it currently considers unavailable.
 call and every browser tab goes through an SSM port-forward to the bastion:
 
 ```
-./scripts/tunnel.sh -a horizon              # 6443, for oc/kubectl
-sudo -E ./scripts/tunnel.sh -a horizon --console   # 443, for the web console
+./scripts/tunnel.sh -a horizon                    # 6443 only, for oc/kubectl
+
+sudo -E ./scripts/tunnel.sh -a horizon --all \
+  --profile Workload-Admin-PS-342831714456        # 6443 + 443, one command
 ```
 
-One session forwards one port, so the console tunnel is a second terminal. The
-script reads `accounts/<alias>.tfvars` directly — no terraform state, any
-working directory — checks the `/etc/hosts` entries the tunnel needs before
-binding anything, and reconnects when the session hits its idle timeout
-(see the Troubleshooting row below for why that matters). Ctrl-C closes it.
+An SSM session forwards exactly one port, but one invocation supervises as many
+as you ask for, so `--all` (or `--api --console`) gives you both from a single
+terminal, output prefixed `[api]` / `[console]`. The flags combine rather than
+override.
+
+Anything including the console binds privileged port 443, so it needs `sudo` —
+and `--profile`, which is not optional there; see Phase 7 for why.
+
+The script reads `accounts/<alias>.tfvars` directly — no terraform state, any
+working directory — checks each port and the `/etc/hosts` entries before
+binding anything, and reconnects each tunnel independently when its session
+hits the idle timeout (see the Troubleshooting row below for why that matters).
+Ctrl-C closes all of them. If one tunnel fails outright rather than timing out,
+the rest are closed too and the exit code is non-zero — a half-up set of
+tunnels is worse than none.
 
 Heavy or long-running work is still better done from the bastion itself, which
 reaches the API over the VPC with no tunnel in the path.
@@ -624,6 +653,7 @@ patience has proven necessary.
 | Objects wedged in `Terminating` under `openshift-ingress` | Same cause as above: the load-balancer Service holds a finalizer that can never complete, because the ELB it refers to was never created |
 | A PVC binds to an unexpected class, or sits `Pending` with no provisioner named | Two StorageClasses are both marked default — see Post-install cleanup. `oc get sc` shows more than one `(default)` |
 | `oc` suddenly fails with `connection refused` to `127.0.0.1:6443` after a quiet spell | The SSM port-forward session timed out: `Your session timed out due to inactivity and has been terminated`. It closes cleanly (exit 0), so nothing looks broken until the next command. Restart the port-forward; long-running work through the tunnel should keep it busy or expect to reconnect. `./scripts/tunnel.sh` rides through this — it reconnects and logs each reconnect, so the tunnel dying stops being invisible |
+| A tunnel logs `Starting session with SessionId: ...` and then nothing — its port never opens, with no error | Another user's process already holds that local port, almost always an earlier `sudo tunnel.sh` still running in a forgotten terminal. Unprivileged `lsof` cannot see root-owned sockets, so it looks free; `netstat -an -p tcp \| grep LISTEN` sees it, and `sudo lsof -nP -iTCP:<port> -sTCP:LISTEN` names the holder. `tunnel.sh` checks both ways now and refuses to start rather than failing silently |
 | `aws sso login` fails with `[Errno 13] Permission denied` on a hash-named file under `~/.aws/sso/cache/` | An earlier `sudo -E` run (the console tunnel on 443) left a root-owned token in your own `~/.aws`. The filename is a hash of the start URL and names nothing actionable. `find ~/.aws -user 0 -delete`, then log in again — no sudo needed, the directories are yours. `tunnel.sh` restores ownership on exit now, and warns about leftovers |
 
 When a pod is in `CrashLoopBackOff` and you've just fixed its cause,
