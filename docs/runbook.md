@@ -280,6 +280,210 @@ console in a browser needs a tunnel on 443 to
 
 ---
 
+## Phase 8 — Storage
+
+The cluster has no working CSI driver and cannot have one — see
+`docs/architecture.md`'s storage section for why every credential path is
+closed. Storage is EFS spoken as plain NFS, with dynamic provisioning from
+`nfs-subdir-external-provisioner`. Nothing in the cluster ever calls an AWS API.
+
+The manifest ships with a literal `EFS_DNS_NAME` placeholder, because the
+filesystem doesn't exist until Terraform has run. Substitute it from the
+Terraform output at apply time:
+
+```
+efs_dns=$(cd terraform && terraform output -raw efs_dns_name)
+sed "s/EFS_DNS_NAME/${efs_dns}/g" manifests/storage/nfs-provisioner.yaml | oc apply -f -
+```
+
+Use the DNS name, not the mount target IP. Both work, but the bastion's CoreDNS
+forwards everything outside the cluster domain upstream (see the `Corefile` in
+`templates/bastion-userdata.sh.tpl`), so nodes resolve
+`fs-*.efs.<region>.amazonaws.com` fine — and the DNS name survives a mount
+target being recreated with a different address.
+
+Prove it works before moving on. A StorageClass that exists is not a
+StorageClass that provisions:
+
+```
+oc get sc                       # efs-nfs, and it should be the only default
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scratch
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: efs-nfs
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+oc get pvc scratch              # must reach Bound
+oc delete pvc scratch
+```
+
+---
+
+## Phase 9 — Internal image registry
+
+The registry is backed by a PVC on `efs-nfs`. Its native S3 backend is not an
+option here for the same reason no CSI driver works: the registry runs as a pod,
+and pods in this cluster cannot hold an AWS credential. See
+`docs/architecture.md`.
+
+```
+oc apply -f manifests/registry/registry-pvc.yaml
+oc get pvc image-registry-storage -n openshift-image-registry   # wait for Bound
+```
+
+**Then clear the S3 stanza — this is the step that trips people.** On AWS the
+registry operator defaults `spec.storage` to `s3`, *and* it auto-detects a PVC
+named `image-registry-storage` and fills in `spec.storage.pvc`. You end up with
+both set, and the operator refuses to do anything:
+
+```
+Progressing: Unable to apply resources: unable to sync storage configuration:
+exactly one storage type should be configured at the same time, got 2: [S3 PVC]
+```
+
+A merge patch adding `pvc` will not fix it, because it leaves `s3` in place.
+Null the S3 key explicitly:
+
+```
+oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge \
+  -p '{"spec":{"storage":{"s3":null}}}'
+```
+
+Confirm the rest of the config while you are there — on this cluster
+`managementState: Managed`, `replicas: 2` and `rolloutStrategy: RollingUpdate`
+were already correct by default. Two replicas are only safe because the volume
+is RWX; with RWO you would need one replica and `Recreate`.
+
+```
+oc get co image-registry           # Available=True, Progressing=False, Degraded=False
+oc get pods -n openshift-image-registry
+```
+
+### If builds fail with `InvalidOutputReference`
+
+`Output image could not be resolved` after the registry has just come up means
+the `openshift-controller-manager` is still holding the old, empty
+`internalRegistryHostname`. The ImageStream will show an empty
+`status.dockerImageRepository` at first and populate a minute or two later — but
+the build controller does **not** pick it up on its own. Restart it:
+
+```
+oc delete pods -n openshift-controller-manager --all
+```
+
+Both were hit for real on 19 Aug 2026; neither error names the actual cause.
+
+### Proving it works
+
+An `Available=True` operator is not proof that the registry can store anything.
+Do a real round-trip:
+
+```
+oc new-project registry-test
+oc new-build --name=roundtrip --binary --strategy=docker
+oc start-build roundtrip --from-dir=<dir with a Dockerfile> --follow
+oc run pulltest --image=image-registry.openshift-image-registry.svc:5000/registry-test/roundtrip:latest \
+  --restart=Never --command -- cat /test.txt
+oc logs pulltest
+oc delete project registry-test
+```
+
+And confirm the blobs really landed on EFS rather than somewhere ephemeral:
+
+```
+pod=$(oc get pods -n openshift-image-registry -l docker-registry=default -o name | head -1)
+oc exec -n openshift-image-registry $pod -- sh -c \
+  'df -h /registry; ls /registry/docker/registry/v2/repositories/'
+```
+
+The mount should read
+`fs-*.efs.<region>.amazonaws.com:/openshift/openshift-image-registry-image-registry-storage`.
+
+---
+
+## Post-install cleanup
+
+Three things the installer leaves in a state that needs a decision. None are
+optional if you want `oc get clusteroperators` to come back clean.
+
+**Remove the second default StorageClass.** The installer creates `gp3-csi` and
+marks it default; `efs-nfs` is also default. Two defaults is undefined
+behaviour — a PVC that names no class binds to whichever the API server picks.
+`gp3-csi` cannot provision anything here (its driver has no credential), so the
+annotation has to come off it, not off `efs-nfs`:
+
+```
+oc patch storageclass gp3-csi -p \
+  '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
+```
+
+**The `storage` operator cannot simply be switched off — do not use
+`managementState: Removed` on it.** That instruction circulated in an earlier
+handoff and is wrong. The operator rejects the value and reports a *second*
+degraded condition on top of the one you were trying to clear:
+
+```
+ManagementStateDegraded: Removed is not supported for storage operator
+```
+
+Verified directly on this cluster. If it has already been set, put it back:
+
+```
+oc patch storage cluster --type=merge -p '{"spec":{"managementState":"Managed"}}'
+```
+
+The operator is Degraded because the EBS CSI *controller* can never start here
+— it runs on the pod network and cannot reach IMDS for a credential (see
+`docs/architecture.md`). The driver's own object is the supported lever:
+
+```
+oc get clustercsidriver ebs.csi.aws.com -o jsonpath='{.spec.managementState}'
+oc patch clustercsidriver ebs.csi.aws.com --type=merge \
+  -p '{"spec":{"managementState":"Removed"}}'
+```
+
+**Untested as of 19 Aug 2026** — the storage operator refuses `Removed` for
+itself, and whether it accepts it for a driver it considers required on AWS has
+not been confirmed. Verify the result rather than assuming it worked. If it is
+also refused, the honest position is that `storage` stays Degraded on this
+platform and belongs in the known-inert list below, not that it can be cleared.
+
+**Confirm `control-plane-machine-set` is inertly Degraded** — do not assume it,
+and be aware the obvious explanation is the wrong one. It is tempting to say
+"UPI masters have no `Machine` objects, so of course the CPMS is unhappy."
+Check, and you find they do have them:
+
+```
+oc get machines.machine.openshift.io -n openshift-machine-api
+oc get machine.machine.openshift.io <name> -n openshift-machine-api -o jsonpath='{.status}' | jq
+```
+
+The three master `Machine` objects exist, created by the installer, sitting at
+an empty `phase`. The real reason is on the `InstanceExists` condition:
+
+```
+failed to create aws client: aws credentials secret
+openshift-machine-api/aws-cloud-credentials ... not found
+```
+
+This is the **same missing-cloud-credential wall** as the CSI drivers, the
+registry's S3 backend and IMDS-from-pods — not a separate UPI quirk. The
+machine controller cannot talk to EC2, so it can never mark a `Machine`
+Running, so the CPMS reports `No ready control plane machines found`.
+
+It is inert *today* because the controller cannot act at all. Worth
+remembering that the CPMS is `Active` with 3 unavailable replicas: if a working
+cloud credential ever appeared in this cluster, that controller would become
+able to act on control-plane machines it currently considers unavailable.
+
+---
+
 ## Day-2 operations
 
 **Pausing between work sessions** — stops instances, pausing compute
@@ -353,6 +557,10 @@ patience has proven necessary.
 | Every node goes `NotReady` at once, `Kubelet stopped posting node status`, all within seconds of each other | The nodes rebooted (almost certainly an MCO rollout) and came back with no IP. Check the console banner for `ens5:` with nothing after it. The kernel args only configure the initramfs; the real root needs the NetworkManager keyfile from `templates/node-network.nmconnection.tpl`. Note `:6443` can stay open through this — CRI-O keeps existing containers running even with kubelet down, so an open port is not proof of a healthy node |
 | Nodes stay `NotReady` forever, `aws-cloud-controller-manager` in CrashLoopBackOff | Missing `cluster_infra_id` tag, or a missing EC2 permission on the master role. Read the pod's actual logs — it names the exact denied action |
 | `oc` reports `TLS handshake timeout` while `wait-for` runs fine | SSM tunnel contention. Run `oc` from the bastion |
+| `ingress` stuck `Available=False`, router Service at `EXTERNAL-IP <pending>`, operator logging `SyncLoadBalancerFailed` | The default IngressController was not pinned to `HostNetwork` before `create ignition-configs`. It is trying to build an SCP-denied ELB. `endpointPublishingStrategy` is immutable once the object exists, so this cannot be patched — the IngressController has to be deleted and recreated. Cheaper to regenerate ignition and reinstall |
+| Objects wedged in `Terminating` under `openshift-ingress` | Same cause as above: the load-balancer Service holds a finalizer that can never complete, because the ELB it refers to was never created |
+| A PVC binds to an unexpected class, or sits `Pending` with no provisioner named | Two StorageClasses are both marked default — see Post-install cleanup. `oc get sc` shows more than one `(default)` |
+| `oc` suddenly fails with `connection refused` to `127.0.0.1:6443` after a quiet spell | The SSM port-forward session timed out: `Your session timed out due to inactivity and has been terminated`. It closes cleanly (exit 0), so nothing looks broken until the next command. Restart the port-forward; long-running work through the tunnel should keep it busy or expect to reconnect |
 
 When a pod is in `CrashLoopBackOff` and you've just fixed its cause,
 `oc delete pod -l <selector>` skips the growing backoff timer instead of
@@ -360,20 +568,42 @@ waiting it out. Safe for anything Deployment-managed.
 
 ---
 
-## Known unresolved
+## Current state
 
-As of the last session, `wait-for bootstrap-complete` still does not
-complete. Nodes reach `Ready` with CNI up, but cluster operators stall:
-masters never receive their etcd/kube-apiserver static pod manifests
-(`/etc/kubernetes/manifests/` holds only `criometricsproxy.yaml`), because
-CVO is stuck behind operators that cannot reach the in-cluster `kubernetes`
-Service ClusterIP at `172.30.0.1:443` from inside a pod — even though
-external API access through HAProxy works throughout. The Service's
-Endpoints object does list a real backend, so the open question is whether
-OVN-Kubernetes' service load-balancing for that ClusterIP is functioning.
+As of **19 August 2026** this design reaches a working cluster and keeps it:
 
-Next diagnostic step:
+- `bootstrap-complete` in 4m20s (every attempt before 18 Aug timed out at 45
+  minutes), 3/3 masters `Ready`, console reachable.
+- **A hibernate/wake cycle has now been survived for real.** This was the open
+  risk in the previous handoff — the cluster had never been stopped and started
+  again. All three masters came back with their addresses intact, so the
+  NetworkManager keyfile fix holds beyond the MCO reboot it was written for.
+- Dynamic RWX storage on `efs-nfs`, re-verified after that reboot.
+- Internal image registry working, PVC-backed, with a full build → push → pull
+  round-trip verified.
 
-```
-oc debug node/<name> -- chroot /host curl -k https://172.30.0.1:443/healthz
-```
+The ClusterIP problem previously recorded here — operators unable to reach the
+`kubernetes` Service ClusterIP at `172.30.0.1:443` from inside a pod, leaving
+masters without their etcd/kube-apiserver static pod manifests — was **not** an
+OVN service-load-balancing fault. It was two missing security-group rules
+(`bootstrap_api_from_master` and `master_api_from_master`). The DNAT'd packet
+leaves the node directly rather than going via the bastion, so no
+bastion-sourced rule covered it. Both now exist in `modules/security-groups`.
+
+### Known-inert, do not chase
+
+- **`control-plane-machine-set` Degraded** is expected here, but *not* for the
+  reason usually given. The masters do have `Machine` objects; the machine
+  controller simply has no cloud credential to reconcile them with. Same root
+  cause as everything else in this cluster. Confirm the condition message
+  rather than assuming it — see Post-install cleanup for what to check.
+- **`network` permanently `Progressing`.** Its
+  `cloud-network-config-controller` pod is stuck in `ContainerCreating` on
+  `secret "cloud-credentials" not found` — the credential wall again. The
+  operator stays `Available=True`/`Degraded=False`, and the controller only
+  drives optional cloud networking features this design does not use.
+- **`storage` Degraded.** The EBS CSI controller can never start here, and the
+  storage operator refuses `managementState: Removed` for itself. Unless the
+  `ClusterCSIDriver`-level removal in Post-install cleanup turns out to work,
+  this operator stays Degraded on this platform. Treat it as inert; do not keep
+  patching at it.

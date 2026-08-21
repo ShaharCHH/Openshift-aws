@@ -26,3 +26,6 @@ accounts/backend/*.backend.hcl
 
 # macOS
 .DS_Store
+
+#shahar notes
+shahar-notes.txt

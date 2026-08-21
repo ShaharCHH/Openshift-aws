@@ -1,0 +1,28 @@
+# Storage for the internal image registry.
+#
+# WHY A PVC AND NOT S3: the registry's native AWS backend needs a cloud
+# credential, and nothing in this cluster can hold one -- iam:CreateUser and
+# iam:CreateOpenIDConnectProvider are both SCP-denied, and pods cannot reach
+# IMDS to borrow the node's identity (OVN does not forward traffic to
+# 169.254.169.254). The same wall that rules out every CSI driver rules out the
+# registry's S3 backend here. See docs/architecture.md's storage section.
+#
+# ReadWriteMany is what allows more than one registry replica: both pods mount
+# this volume at once, which is why the registry config can use
+# rolloutStrategy: RollingUpdate. With RWO it would have to be a single replica
+# with Recreate.
+#
+# 100Gi is bookkeeping, not a limit -- EFS is elastic, and the efs-nfs
+# StorageClass sets allowVolumeExpansion: false because there is nothing to
+# expand.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: image-registry-storage
+  namespace: openshift-image-registry
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: efs-nfs
+  resources:
+    requests:
+      storage: 100Gi

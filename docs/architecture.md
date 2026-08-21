@@ -7,9 +7,11 @@ ordered command sequence to actually deploy a cluster, see
 ## Why this looks different from a standard OpenShift UPI install
 
 This account's SCP blocks Route 53, ELB/NLB creation, Elastic IPs, launching
-or copying any AMI the account doesn't itself own, and the vmimport service
-role's internal snapshot-copy step (see `docs/scp-blockers.md` for the full,
-individually-verified list). Every departure from the "normal" AWS UPI
+or copying any AMI the account doesn't itself own, the vmimport service
+role's internal snapshot-copy step, and — with the widest consequences of any
+of them — both ways of issuing an IAM identity to an in-cluster component
+(`iam:CreateUser` and `iam:CreateOpenIDConnectProvider`). See
+`docs/scp-blockers.md` for the full, individually-verified list. Every departure from the "normal" AWS UPI
 reference architecture below exists to route around one of those. The
 design is meant to be repeatable across other client accounts that carry
 the same kind of restrictions, not a one-off hack for this account
@@ -48,8 +50,7 @@ three containers:
   (Machine Config Server), 443/80 (ingress). Replaces the NLB a standard UPI
   install would use.
 - **A static HTTP server on port 8080** — serves ignition files to cluster
-  nodes. See "How Ignition works" below for why this exists and what it
-  replaced. It is started by `sync-config.sh` *after* the first successful
+  nodes. It is started by `sync-config.sh` *after* the first successful
   S3 pull, never by the day-0 userdata directly: Ignition retries a refused
   connection but treats HTTP 404 as fatal, so a server listening on an empty
   directory kills every node booting in that window. Keeping the port closed
@@ -246,6 +247,150 @@ outbound HTTPS access at all, which the bastion's S3 pull now depends on.
 It intentionally does **not** try to prove "S3 is reachable" specifically;
 generic HTTPS egress is the actual dependency, and it's a cheaper, more
 general thing to test.
+
+## Ingress publishes on the host network, and that is an install-time decision
+
+On AWS the installer's default `endpointPublishingStrategy` is
+`LoadBalancerService`, which makes the ingress operator provision a Classic
+ELB — the operation this account's SCP blocks outright (`docs/scp-blockers.md`
+row 4), and the whole reason HAProxy runs on the bastion at all. Left at the
+default, ingress never comes up: the operator reports `SyncLoadBalancerFailed`
+forever, the router Service sits at `EXTERNAL-IP <pending>`, and the `ingress`
+clusteroperator stays `Available=False` — which alone is enough to fail
+`wait-for install-complete`. Worse, the objects it leaves behind deadlock on a
+finalizer that can never complete, so they sit in `Terminating` indefinitely.
+
+`HostNetwork` makes the router pods bind each node's own `:80`/`:443` instead,
+which is exactly what Terraform's `haproxy_config` ingress backends already
+point at (master IPs, in this compact topology).
+
+**The timing is the part that matters.** `endpointPublishingStrategy` is
+immutable once the IngressController exists — fixing it after the fact means
+deleting and recreating the IngressController by hand. So it is written as a
+manifest by `scripts/ignition/generate-ignition.sh` in the one window where the
+manifests are still editable: between `create manifests` and
+`create ignition-configs`. This is the same window, and the same reasoning, as
+any other install-time-only override.
+
+## Storage: EFS used as a plain NFS server, not through a CSI driver
+
+The short version: **this cluster cannot hold a cloud credential**, so it
+cannot run a CSI driver, so its storage has to come from something that speaks
+a protocol rather than an AWS API.
+
+`install-config` sets `credentialsMode: Manual` — an SSO session cannot supply
+the long-lived keys the Cloud Credential Operator would otherwise mint — so
+nothing issues credentials automatically. Both ways of supplying them by hand
+are hard-denied, probed for real rather than assumed:
+
+```
+iam:CreateUser                    explicit deny, policy p-cf140vwn
+iam:CreateOpenIDConnectProvider   explicit deny, policy p-77bk5ceo
+```
+
+That rules out both the static-key path and the OIDC/STS path, which are the
+only two supported ways to give an AWS CSI driver an identity.
+
+The instance profile is not a way out either, and this one fails for a reason
+that has nothing to do with SCPs: the EBS CSI **controller** runs on the pod
+network (`hostNetwork: false`), and OVN-Kubernetes does not forward pod traffic
+to `169.254.169.254`. It can therefore never reach IMDS to borrow the node's
+identity. Confirmed directly on this cluster — from a node, IMDS returns
+`horizon-horizon-master`; from a pod, no response at all, with the hop limit
+raised to 2 and no firewall rule on the node to explain it. This is why the
+IMDS hop limit is pinned at **1** in `modules/control-plane`: raising it to 2
+looks like it should open that path and measurably does not, so the larger
+blast radius buys nothing.
+
+**The same wall shows up in three other places**, and it is worth recognising it
+once rather than debugging it three more times:
+
+- `machine-api` cannot reconcile the masters' `Machine` objects — they exist,
+  but sit at an empty `phase` with `failed to create aws client: aws credentials
+  secret openshift-machine-api/aws-cloud-credentials ... not found`. That is the
+  real reason `control-plane-machine-set` reports Degraded, not the "UPI has no
+  Machine objects" explanation that sounds right.
+- The image registry's native S3 backend is unusable for the same reason, which
+  is why the registry is backed by a PVC on `efs-nfs` instead.
+- `cloud-network-config-controller` never starts: its pod sits in
+  `ContainerCreating` forever on `MountVolume.SetUp failed for volume
+  "cloud-provider-secret" : secret "cloud-credentials" not found`. This keeps the
+  `network` clusteroperator permanently `Progressing=True`, though it stays
+  `Available=True` and `Degraded=False` — the controller only manages optional
+  cloud networking features (egress IPs and similar), none of which this design
+  uses. Benign, and not worth chasing.
+- Any future operator that expects to call an AWS API from a pod will fail the
+  same way. The question to ask first is always "what identity does this think
+  it has?"
+
+**EFS is the way through, and it was worth probing rather than assuming** — it
+is the first capability tested in this account that turned out *not* to be
+blocked:
+
+```
+elasticfilesystem:CreateFileSystem    ALLOWED
+elasticfilesystem:CreateMountTarget   ALLOWED (ENI placed in the private subnet)
+```
+
+Because EFS speaks NFSv4.1, nothing inside the cluster ever calls an AWS API:
+static PVs need no driver at all, and dynamic provisioning is done by
+`nfs-subdir-external-provisioner`, which only ever performs NFS operations.
+A mount target is simply an ENI holding an IP in the private subnet, which is
+also why this works with `ec2:CreateVpcEndpoint` denied — there is no endpoint
+involved.
+
+`terraform/modules/efs` builds the filesystem, its own security group (NFS 2049
+referenced by security group, never CIDR — the subnet is shared with other
+teams), and one mount target per subnet.
+
+### Two OpenShift-specific details in the provisioner manifest
+
+`manifests/storage/nfs-provisioner.yaml` is not the upstream example manifest,
+for two reasons that are easy to trip over:
+
+1. **It mounts the export through a PVC, not a pod-level `nfs:` volume.**
+   OpenShift's default `restricted-v2` SCC does not permit the `nfs` volume
+   type, so a direct `nfs:` volume would require running the provisioner under
+   a privileged SCC. Going via a PersistentVolume lets kubelet perform the
+   mount and keeps the pod under the default SCC.
+2. **The export root is `/openshift`, pre-created mode 1777** — not `/`, which
+   EFS leaves as `root:root 755`. Pods here run as an arbitrary non-root UID,
+   so a world-writable, sticky parent is what lets the provisioner create
+   per-PVC subdirectories at all.
+
+The StorageClass uses `onDelete: retain`, keeping data after a PVC is deleted
+until an operator decides otherwise — the alternative silently discards
+contents, and EFS storage is cheap.
+
+**Trade-off accepted:** this is file storage (RWX, `allowVolumeExpansion:
+false`), not block. That is fine for general workloads and wrong for a heavy
+database — anything wanting block semantics or single-writer performance has no
+answer in this account today.
+
+### The image registry rides on the same storage
+
+The cluster originally shipped with no image registry, because there was no
+storage to put one on. Once `efs-nfs` existed, that reason expired and the
+registry was enabled (19 Aug 2026), backed by a PVC rather than S3.
+
+S3 is unavailable here for exactly the reason the CSI drivers are: the registry
+runs as a pod, and pods cannot hold an AWS credential. This is worth stating
+plainly because S3 *is* reachable from this VPC — the bastion pulls ignition
+from it on every boot. The obstacle is identity, not connectivity, and that
+distinction is easy to lose.
+
+`ReadWriteMany` is what makes the registry's default two-replica
+`RollingUpdate` shape work: both pods mount the same volume at once. On RWO
+storage the registry has to run a single replica with `Recreate`.
+
+**One caveat carried knowingly.** Red Hat's guidance cautions against
+NFS-backed registry storage, on concurrent-write and file-locking grounds; that
+guidance was written against RHEL's NFS server rather than AWS-managed EFS, so
+this is not precisely the configuration they tested, but it is close enough that
+the caveat should not be waved away. A full build → push → pull round-trip was
+verified working on 19 Aug 2026. If push corruption or stuck mounts ever appear,
+the fallback is one replica with `rolloutStrategy: Recreate`, which removes the
+concurrent-write question entirely.
 
 ## `terraform test` gotcha worth knowing before adding more test files
 
