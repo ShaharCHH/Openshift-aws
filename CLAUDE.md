@@ -58,6 +58,7 @@ terraform apply -var-file=../accounts/horizon.tfvars \
 ./scripts/tunnel.sh -a horizon                     # SSM port-forward, 6443
 sudo -E ./scripts/tunnel.sh -a horizon --all \
   --profile <profile>                              # 6443 + 443 (console)
+./scripts/update-kubeconfig.sh -a horizon          # merge into ~/.kube/config
 ./scripts/hibernate.sh -a horizon                  # stop instances (EBS still bills)
 ./scripts/wake.sh -a horizon
 ```

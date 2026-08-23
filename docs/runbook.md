@@ -282,6 +282,18 @@ export KUBECONFIG=../.ignition/horizon/auth/kubeconfig
 oc get clusteroperators
 ```
 
+That `export` only covers the current shell. To make access persist across
+terminals and sessions, merge the cluster's kubeconfig into
+`~/.kube/config` instead:
+
+```
+./scripts/update-kubeconfig.sh -a horizon
+```
+
+This renames the context/cluster/user to `horizon` (openshift-install's
+default names are generic and would collide if you ever merge a second
+account's kubeconfig in) and sets it as the current context.
+
 Every operator reporting `Available=True` is the finish line. Console
 credentials are in `.ignition/horizon/auth/kubeadmin-password`; reaching the
 console in a browser needs a tunnel on 443:
