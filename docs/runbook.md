@@ -362,9 +362,18 @@ The cluster has no working CSI driver and cannot have one — see
 closed. Storage is EFS spoken as plain NFS, with dynamic provisioning from
 `nfs-subdir-external-provisioner`. Nothing in the cluster ever calls an AWS API.
 
-The manifest ships with a literal `EFS_DNS_NAME` placeholder, because the
-filesystem doesn't exist until Terraform has run. Substitute it from the
-Terraform output at apply time:
+```
+./day2/apply-storage.sh -a horizon
+./day2/verify-storage.sh -a horizon
+```
+
+`apply-storage.sh` first prepares the EFS export root (see
+`docs/architecture.md`'s storage section for why that's a real, one-time,
+root-level prerequisite and not just a footnote), then substitutes the
+manifest's `EFS_DNS_NAME` placeholder from the same tag-based EFS lookup and
+applies it. `verify-storage.sh` proves the StorageClass actually provisions,
+not just that the object exists — a scratch RWX PVC that reaches `Bound`, then
+gets deleted. The underlying commands:
 
 ```
 efs_dns=$(cd terraform && terraform output -raw efs_dns_name)
@@ -377,7 +386,7 @@ forwards everything outside the cluster domain upstream (see the `Corefile` in
 `fs-*.efs.<region>.amazonaws.com` fine — and the DNS name survives a mount
 target being recreated with a different address.
 
-Prove it works before moving on. A StorageClass that exists is not a
+And `verify-storage.sh`'s check — a StorageClass that exists is not a
 StorageClass that provisions:
 
 ```
@@ -406,6 +415,18 @@ The registry is backed by a PVC on `efs-nfs`. Its native S3 backend is not an
 option here for the same reason no CSI driver works: the registry runs as a pod,
 and pods in this cluster cannot hold an AWS credential. See
 `docs/architecture.md`.
+
+```
+./day2/setup-registry.sh -a horizon
+./day2/verify-registry.sh -a horizon
+```
+
+`setup-registry.sh` applies the PVC, waits for `Bound`, then clears the S3
+stanza and waits for the operator to settle. `verify-registry.sh` does a real
+build → push → pull round-trip and confirms the blobs landed on EFS, not
+somewhere ephemeral — and if the build fails with `InvalidOutputReference`, it
+restarts `openshift-controller-manager` and retries once automatically (see
+below for why that's the fix). The underlying commands:
 
 ```
 oc apply -f manifests/registry/registry-pvc.yaml
@@ -453,11 +474,13 @@ oc delete pods -n openshift-controller-manager --all
 ```
 
 Both were hit for real on 19 Aug 2026; neither error names the actual cause.
+`day2/verify-registry.sh` detects this error and does the restart-and-retry
+itself.
 
 ### Proving it works
 
 An `Available=True` operator is not proof that the registry can store anything.
-Do a real round-trip:
+`day2/verify-registry.sh` automates all of this. The underlying round-trip:
 
 ```
 oc new-project registry-test
@@ -486,6 +509,17 @@ The mount should read
 
 Three things the installer leaves in a state that needs a decision. None are
 optional if you want `oc get clusteroperators` to come back clean.
+
+```
+./day2/post-install-cleanup.sh -a horizon
+```
+
+Runs all three steps below in order, verifying each result rather than
+assuming it (two of them were previously done wrong on this cluster, and the
+third — the `ClusterCSIDriver` lever — has no confirmed outcome as of this
+writing; the script reads the value back and reports what actually happened).
+It also runs the known-inert condition-message check
+(`scripts/check-known-inert.sh`) at the end. The underlying commands:
 
 **Remove the second default StorageClass.** The installer creates `gp3-csi` and
 marks it default; `efs-nfs` is also default. Two defaults is undefined
@@ -528,6 +562,12 @@ itself, and whether it accepts it for a driver it considers required on AWS has
 not been confirmed. Verify the result rather than assuming it worked. If it is
 also refused, the honest position is that `storage` stays Degraded on this
 platform and belongs in the known-inert list below, not that it can be cleared.
+`day2/post-install-cleanup.sh` runs this and reports which outcome it saw —
+if it stuck, it goes on to delete `gp3-csi`/`gp2-csi` outright instead of just
+de-annotating them; if it didn't, it falls back to the de-annotate-only
+behaviour above and says so. Whatever it reports the first time this actually
+runs, update this section with the confirmed answer rather than leaving both
+outcomes open.
 
 **Confirm `control-plane-machine-set` is inertly Degraded** — do not assume it,
 and be aware the obvious explanation is the wrong one. It is tempting to say
@@ -590,6 +630,20 @@ tunnels is worse than none.
 Heavy or long-running work is still better done from the bastion itself, which
 reaches the API over the VPC with no tunnel in the path.
 
+`tunnel.sh` only *warns* about missing `/etc/hosts` entries — "`/etc/hosts` is
+the operator's file, not this script's." `./scripts/hosts-entries.sh -a horizon
+[--api] [--console] [--all]` is the opt-in writer, for whoever would rather run
+one command than copy-paste the line it prints.
+
+**Checking cluster health** — `oc get clusteroperators` includes three
+operators expected to stay unhealthy forever on this platform (see
+"Known-inert" below), which makes a real new problem easy to miss in the noise:
+
+```
+./scripts/cluster-health.sh -a horizon      # co, with the known-inert three called out separately
+./scripts/check-known-inert.sh -a horizon   # confirms those three are broken for the EXPECTED reason
+```
+
 **Pausing between work sessions** — stops instances, pausing compute
 billing. EBS volumes bill regardless, so this is for gaps of days, not
 weeks; for anything longer, destroy and rebuild:
@@ -604,17 +658,21 @@ since CoreDNS and HAProxy need to be up before masters can rejoin cleanly.
 Both scripts find instances by the `Project=openshift-upi` +
 `AccountAlias=<alias>` default tags.
 
-**Tearing the cluster down but keeping the bastion** — useful between
-rebuild attempts:
+**Tearing down** — `./scripts/teardown.sh -a horizon [--keep-bastion]
+[--deregister-ami]`. Unlike the rest of this repo's scripts, it's irreversible,
+so it asks you to type the account alias back before touching anything.
+`--keep-bastion` is useful between rebuild attempts; `--deregister-ami` also
+handles the custom AMI and its snapshot, which are **not** Terraform-managed
+and survive either mode otherwise. The underlying commands:
 
 ```
+# keep the bastion (masters/bootstrap only)
 terraform apply -var-file=../accounts/horizon.tfvars \
   -var="masters_enabled=false" -var="bootstrap_enabled=false"
-```
 
-**Full teardown:** `terraform destroy -var-file=../accounts/horizon.tfvars`.
-The custom AMI and its snapshot are not Terraform-managed and survive —
-deregister them by hand if you want them gone.
+# full teardown
+terraform destroy -var-file=../accounts/horizon.tfvars
+```
 
 ---
 
@@ -625,6 +683,14 @@ laggy enough to send this project down two dead ends — it showed nothing at
 all for an instance that was demonstrably alive and actively retrying at 500+
 seconds of uptime. Console silence is not evidence of a hang. Use the EC2
 Serial Console for live output:
+
+```
+./scripts/serial-console.sh -a horizon --instance <instance-id>
+```
+
+Handles both traps below itself — enables serial console access, pushes the
+key, and execs straight into `ssh` with no gap between push and connect. The
+underlying commands:
 
 ```
 aws ec2 enable-serial-console-access          # once, account-level
@@ -687,6 +753,14 @@ As of **19 August 2026** this design reaches a working cluster and keeps it:
 - Dynamic RWX storage on `efs-nfs`, re-verified after that reboot.
 - Internal image registry working, PVC-backed, with a full build → push → pull
   round-trip verified.
+
+**Added 24 Aug 2026, not yet verified against a live cluster** (repo-only
+session — see `SESSION_STATE.md`): the `day2/` and `scripts/` additions this
+section and Phases 8/9 now reference, a fix for the EFS `/openshift` export
+root previously created by hand and recorded nowhere
+(`docs/architecture.md`'s storage section), and EFS/IAM coverage in
+`scripts/preflight/scp-probes.sh`. Run them before trusting this bullet the
+way the ones above it are trusted.
 
 The ClusterIP problem previously recorded here — operators unable to reach the
 `kubernetes` Service ClusterIP at `172.30.0.1:443` from inside a pod, leaving
