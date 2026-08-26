@@ -1,0 +1,52 @@
+# External route to the internal image registry.
+#
+# WHY REENCRYPT AND NOT PASSTHROUGH: passthrough terminates TLS at the pod,
+# so the client is handed the registry's service-serving cert -- signed by
+# openshift-service-serving-signer@<ts>, a third CA unrelated to the API and
+# ingress roots that scripts/trust-cluster-ca.sh installs. Trusting it would
+# not have been enough, because that cert's SAN is
+#
+#   DNS:image-registry.openshift-image-registry.svc
+#   DNS:image-registry.openshift-image-registry.svc.cluster.local
+#
+# and covers no route hostname at all. External clients fail hostname
+# verification no matter which CAs they trust. A passthrough route was tried
+# for real here on 26 Aug 2026 and this is exactly how it failed.
+#
+# reencrypt terminates at the router instead, which re-signs with the
+# *.apps.<cluster>.<domain> wildcard -- already trusted on any machine that
+# has run scripts/trust-cluster-ca.sh, so this route needs NO new CA on the
+# client side. That is the whole reason for the choice.
+#
+# NO destinationCACertificate, deliberately. The router already validates
+# service-ca-signed backends with its own default:
+#
+#   $ oc set env deploy/router-default -n openshift-ingress --list
+#   DEFAULT_DESTINATION_CA_PATH=/var/run/configmaps/service-ca/service-ca.crt
+#
+# which is precisely what signs the registry pod's cert. Pasting the service
+# CA in here would work today and rot whenever that signer rotates.
+#
+# NO spec.host, also deliberately. OpenShift generates
+# <route>-<namespace>.apps.<cluster>.<domain>, which keeps this manifest
+# account-agnostic -- the same reason registry-pvc.yaml hardcodes nothing.
+# This repo is reused across client accounts (CLAUDE.md), and a literal
+# domain committed here would break that.
+#
+# Reaching this from a laptop additionally needs the 443 tunnel
+# (scripts/tunnel.sh -a <alias> --console) and DNS for *.apps
+# (scripts/setup-apps-dns.sh -a <alias>).
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: registry
+  namespace: openshift-image-registry
+spec:
+  to:
+    kind: Service
+    name: image-registry
+  port:
+    targetPort: 5000-tcp
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect

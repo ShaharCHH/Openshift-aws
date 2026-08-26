@@ -262,28 +262,38 @@ while [ $idx -lt ${#tunnel_ports[@]} ]; do
 done
 
 # The tunnels bind 127.0.0.1, but the kubeconfig and the browser both use the
-# cluster's real names -- so without these entries they are up and unreachable.
-# Warned about rather than written: /etc/hosts is the operator's file, not this
-# script's.
+# cluster's real names -- so without a mapping to 127.0.0.1 they are up and
+# unreachable. Checked by actual resolution (dscacheutil), not by grepping
+# /etc/hosts: scripts/setup-apps-dns.sh points *.apps.<cluster>.<domain> at
+# 127.0.0.1 via dnsmasq + /etc/resolver, which grepping /etc/hosts alone would
+# never see and would misreport as missing. `dig`/`nslookup` are no
+# substitute here -- both query DNS servers directly and honor neither
+# /etc/hosts nor /etc/resolver, so they report NXDOMAIN for a name every real
+# application resolves fine.
+resolves_to_localhost() {
+  dscacheutil -q host -a name "$1" 2>/dev/null | grep -q '^ip_address: 127\.0\.0\.1$'
+}
 missing_lines=""
 missing_flat=""
 for hostlist in "${tunnel_hosts[@]}"; do
   for name in $hostlist; do
-    if ! awk -v n="$name" '!/^[[:space:]]*#/ && $1 == "127.0.0.1" {
-           for (i = 2; i <= NF; i++) if ($i == n) found = 1
-         } END { exit !found }' /etc/hosts; then
+    if ! resolves_to_localhost "$name"; then
       missing_lines="${missing_lines}  ${name}"$'\n'
       missing_flat="${missing_flat}${missing_flat:+ }${name}"
     fi
   done
 done
 if [ -n "$missing_flat" ]; then
-  echo "WARNING: these names do not resolve to 127.0.0.1 in /etc/hosts:" >&2
+  echo "WARNING: these names do not resolve to 127.0.0.1:" >&2
   printf '%s' "$missing_lines" >&2
-  echo "         The tunnel will be up, but nothing will reach it by name. Add them with:" >&2
+  echo "         The tunnel will be up, but nothing will reach it by name. Either add them" >&2
+  echo "         to /etc/hosts:" >&2
   # Only the missing ones -- re-adding a name that is already mapped works, but
   # leaves a duplicate entry behind for someone to puzzle over later.
   echo "           echo '127.0.0.1  ${missing_flat}' | sudo tee -a /etc/hosts" >&2
+  echo "         or resolve the whole *.apps wildcard at once (covers any route," >&2
+  echo "         present or future, not just the ones this command forwards):" >&2
+  echo "           sudo ./scripts/setup-apps-dns.sh -a ${account_alias}" >&2
   echo >&2
 fi
 
