@@ -455,6 +455,47 @@ oc get co image-registry           # Available=True, Progressing=False, Degraded
 oc get pods -n openshift-image-registry
 ```
 
+### Exposing it outside the cluster: reencrypt, never passthrough
+
+```
+oc apply -f manifests/registry/registry-route.yaml
+oc get route -n openshift-image-registry           # TERMINATION should read "reencrypt"
+```
+
+A **passthrough** route was tried for real here on 26 Aug 2026 and looks like
+it should work — TLS reaches the pod, which does present a valid cert. It
+fails anyway: the registry pod's cert is a service-serving cert scoped to
+`image-registry.openshift-image-registry.svc[.cluster.local]`, not the
+route's hostname, so any external client rejects it on a hostname mismatch —
+`certificate is valid for image-registry.openshift-image-registry.svc, not
+registry-....apps...`. Trusting the CA that signs it (a third one,
+`openshift-service-serving-signer@<ts>`, unrelated to both CAs
+`trust-cluster-ca.sh` installs) does not fix this — the SAN is still wrong.
+
+`manifests/registry/registry-route.yaml` uses **reencrypt** instead, which
+terminates at the router and re-signs with the `*.apps.<cluster>.<domain>`
+wildcard — the same CA `trust-cluster-ca.sh` already installs, so a machine
+that has run it needs nothing new. If a passthrough route already exists
+(hand-created, or from an earlier attempt), remove it first — both would
+otherwise claim the same hostname:
+
+```
+oc delete route registry -n openshift-image-registry
+```
+
+**Reaching it from a laptop** needs the console/443 tunnel
+(`scripts/tunnel.sh -a horizon --console`, or `--all`) and the route's
+hostname resolving to `127.0.0.1` — either an `/etc/hosts` line, or
+`scripts/setup-apps-dns.sh -a horizon` to resolve the whole `*.apps` wildcard
+at once. See Day-2 operations below for why that's usually the better choice
+once more than a couple of routes exist.
+
+**`podman`/Docker Desktop need more than this.** Both run the actual
+pull/push inside a Linux VM, where `127.0.0.1` is the VM itself, not the host
+holding the tunnel — the VM has neither the `/etc/resolver` entry nor the
+trusted CA. `curl`, `skopeo`, and `oc image` all work directly from macOS and
+are unaffected.
+
 ### If builds fail with `InvalidOutputReference`
 
 `Output image could not be resolved` after the registry has just come up means
@@ -595,9 +636,11 @@ Anything including the console binds privileged port 443, so it needs `sudo` —
 and `--profile`, which is not optional there; see Phase 7 for why.
 
 The script reads `accounts/<alias>.tfvars` directly — no terraform state, any
-working directory — checks each port and the `/etc/hosts` entries before
-binding anything, and reconnects each tunnel independently when its session
-hits the idle timeout (see the Troubleshooting row below for why that matters).
+working directory — checks each port and whether each hostname actually
+resolves to `127.0.0.1` before binding anything (via `/etc/hosts` or the
+wildcard resolver below — either satisfies it), and reconnects each tunnel
+independently when its session hits the idle timeout (see the Troubleshooting
+row below for why that matters).
 Ctrl-C closes all of them. If one tunnel fails outright rather than timing out,
 the rest are closed too and the exit code is non-zero — a half-up set of
 tunnels is worse than none.
@@ -616,6 +659,25 @@ sudo ./scripts/trust-cluster-ca.sh -a horizon
 See Phase 7 above and `docs/architecture.md` for what this installs and why.
 `--uninstall` removes it again; `--dry-run` shows what would happen without
 touching the trust store or needing root.
+
+**Resolving every route at once, instead of one `/etc/hosts` line per
+route** — this cluster already carries 9 routes (console, downloads, oauth,
+four monitoring routes, the registry, and any app deployed to it), and the
+tunnel forwards all of them on the same port regardless. One-time per
+machine, macOS only:
+
+```
+brew install dnsmasq
+sudo ./scripts/setup-apps-dns.sh -a horizon
+```
+
+Points `*.apps.<cluster>.<domain>` at `127.0.0.1` via a dnsmasq drop-in plus
+`/etc/resolver`, so a route deployed tomorrow resolves with no re-run needed.
+Check it with `dscacheutil -q host -a name <anything>.apps.horizon.ocp.internal`
+— **not** `dig` or `nslookup`, which query DNS servers directly and honor
+neither `/etc/hosts` nor `/etc/resolver`, so they report `NXDOMAIN` for a name
+that works fine in a browser. `--uninstall` removes both files; `--dry-run`
+needs no root and changes nothing.
 
 **Pausing between work sessions** — stops instances, pausing compute
 billing. EBS volumes bill regardless, so this is for gaps of days, not
@@ -687,6 +749,8 @@ patience has proven necessary.
 | Nodes in emergency mode ~90s after launch, `failed to fetch config: resource not found` | The bastion's ignition server answered 404 — it was replaced in the same apply that created the nodes, so it was still empty when they booted. EC2 status checks read `ok`/`ok` throughout. Replace the nodes once the bastion is serving; check `ls /var/ignition-serve/ignition/` on it first |
 | Every node goes `NotReady` at once, `Kubelet stopped posting node status`, all within seconds of each other | The nodes rebooted (almost certainly an MCO rollout) and came back with no IP. Check the console banner for `ens5:` with nothing after it. The kernel args only configure the initramfs; the real root needs the NetworkManager keyfile from `templates/node-network.nmconnection.tpl`. Note `:6443` can stay open through this — CRI-O keeps existing containers running even with kubelet down, so an open port is not proof of a healthy node |
 | Browser shows `NET::ERR_CERT_AUTHORITY_INVALID` on the console, or `curl: (60) SSL certificate problem: self signed certificate in certificate chain` | Expected until `scripts/trust-cluster-ca.sh -a <alias>` has been run on this machine — the cluster signs its own API and ingress certs, and there is no public CA to get instead. `oc` is unaffected; this only matters for the browser, `curl`, and anything else that reads the OS trust store |
+| `certificate is valid for image-registry.openshift-image-registry.svc, not <route>....apps...` | The registry route is `passthrough`, not `reencrypt` — see Phase 9. Trusting more CAs will not fix this; the served cert's SAN never covers the route hostname no matter which CA signs it. Switch to `manifests/registry/registry-route.yaml` |
+| `dig`/`nslookup` report `NXDOMAIN` for a `*.apps` name but the browser and `curl` reach it fine | Expected after `scripts/setup-apps-dns.sh` — both tools query DNS servers directly and bypass `/etc/hosts` and `/etc/resolver` entirely. Use `dscacheutil -q host -a name <name>` instead, which reflects both |
 | Nodes stay `NotReady` forever, `aws-cloud-controller-manager` in CrashLoopBackOff | Missing `cluster_infra_id` tag, or a missing EC2 permission on the master role. Read the pod's actual logs — it names the exact denied action |
 | `oc` reports `TLS handshake timeout` while `wait-for` runs fine | SSM tunnel contention. Run `oc` from the bastion |
 | `ingress` stuck `Available=False`, router Service at `EXTERNAL-IP <pending>`, operator logging `SyncLoadBalancerFailed` | The default IngressController was not pinned to `HostNetwork` before `create ignition-configs`. It is trying to build an SCP-denied ELB. `endpointPublishingStrategy` is immutable once the object exists, so this cannot be patched — the IngressController has to be deleted and recreated. Cheaper to regenerate ignition and reinstall |

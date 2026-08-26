@@ -331,6 +331,34 @@ name being trusted. That fallback exists for bootstrap-adjacent moments (no
 merged kubeconfig yet) more than routine use — the authenticated sources are
 preferred whenever they're reachable.
 
+### A third CA exists, and it is deliberately not trusted here
+
+Every pod-to-pod certificate in the cluster — including the image registry's
+own serving cert — is signed by a *third* root, the service-ca operator's
+`openshift-service-serving-signer@<unix-ts>`. This is not an oversight in the
+table above; it is the reason the registry's external route is `reencrypt`
+and not `passthrough`.
+
+Passthrough hands the client the pod's own cert unmodified, which means the
+service-ca root, which means a cert whose SAN is scoped to
+`image-registry.openshift-image-registry.svc[.cluster.local]` — an in-cluster
+service name, never a route hostname. Trusting that root machine-wide would
+not fix external access: the SAN still would not cover
+`registry-....apps.<cluster>.<domain>`, so hostname verification would still
+fail. It was tried for real, on the running cluster, on 26 Aug 2026, and
+failed exactly that way.
+
+`reencrypt` sidesteps the problem instead of solving it: the router
+terminates the client-facing side itself and re-signs with the ingress
+wildcard, so the service-ca signer never reaches the client at all. The
+router already trusts the service-ca bundle on the *backend* side by default
+(`DEFAULT_DESTINATION_CA_PATH=/var/run/configmaps/service-ca/service-ca.crt`
+on `deploy/router-default`), so `manifests/registry/registry-route.yaml`
+needs no `destinationCACertificate` of its own. This is also why the service
+CA is absent from the table above and from `trust-cluster-ca.sh` — trusting
+it on the client side would be trusting a CA for names it was never issued
+for.
+
 ## Storage: EFS used as a plain NFS server, not through a CSI driver
 
 The short version: **this cluster cannot hold a cloud credential**, so it
