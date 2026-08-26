@@ -445,6 +445,37 @@ for two reasons that are easy to trip over:
    so a world-writable, sticky parent is what lets the provisioner create
    per-PVC subdirectories at all.
 
+**Who creates `/openshift`, and why it can't be the cluster.** Something with
+root has to touch EFS once to create that directory — no pod can do it, for the
+same reason no CSI driver works: nothing in the cluster can hold the identity
+or the privilege for a raw root-level NFS operation. Using `/` as the export
+root instead doesn't dodge this: you'd still need one root-level `chmod 1777`
+on it, and now the *entire* filesystem is world-writable rather than one
+subtree. The one-time root operation is irreducible; only the blast radius is
+a choice.
+
+An EFS Access Point looked like it could avoid this from Terraform alone —
+it can auto-create a root directory with a given owner/mode. It doesn't work
+here: AWS's own docs are explicit that this only happens *at mount time*
+through the access point, not at `CreateAccessPoint` time, and mounting
+through an access point needs the EFS mount helper (`-o
+tls,accesspoint=fsap-...`), which the in-tree `nfs:` volume type this design
+relies on cannot do. So it would still need something to mount once, plus an
+extra `elasticfilesystem:CreateAccessPoint` call that may itself be
+SCP-denied in a client account — strictly worse.
+
+**The bastion does it**, over SSM, via `day2/prepare-efs-root.sh`: it's
+already the utility box for this deployment (DNS, HAProxy, ignition server,
+SSM entry point), and it's the one thing that exists before any cluster node
+does. `terraform/main.tf`'s `module "efs"` gives it a client security-group
+rule for exactly this; `terraform/templates/bastion-userdata.sh.tpl` installs
+`nfs-utils`, though that only reaches a bastion built after this change —
+`prepare-efs-root.sh` installs the package itself over SSM too, so it works
+on an existing bastion without a rebuild. This also leaves a standing way to
+inspect what's on EFS, which matters because of `onDelete: retain` below —
+deleted PVCs leave directories behind with no way to see or reap them
+otherwise.
+
 The StorageClass uses `onDelete: retain`, keeping data after a PVC is deleted
 until an operator decides otherwise — the alternative silently discards
 contents, and EFS storage is cheap.

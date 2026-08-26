@@ -85,10 +85,15 @@ module "efs" {
   subnet_ids  = module.vpc.private_subnet_ids
 
   # Masters carry workloads too in this compact topology, so they mount it as
-  # well as any future workers.
+  # well as any future workers. The bastion is also a client, but only for the
+  # one-time root-level setup of the /openshift export root (day2/prepare-efs-root.sh)
+  # -- nothing in the cluster can create that directory itself, since a fresh EFS
+  # filesystem's root is root:root 755 and every pod runs as an arbitrary non-root
+  # UID. See docs/architecture.md's storage section.
   client_security_group_ids = {
-    master = module.security_groups.master_sg_id
-    worker = module.security_groups.worker_sg_id
+    master  = module.security_groups.master_sg_id
+    worker  = module.security_groups.worker_sg_id
+    bastion = module.security_groups.bastion_sg_id
   }
 }
 

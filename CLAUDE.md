@@ -54,15 +54,24 @@ export TF_VAR_cluster_infra_id=$(../scripts/ignition/extract-infra-id.sh -a hori
 terraform apply -var-file=../accounts/horizon.tfvars \
   -var="masters_enabled=true" -var="bootstrap_enabled=true"           # 4
 
-# Day-2
+# Finishing the build (day2/ — run once, in order, after install-complete)
+./day2/apply-storage.sh -a horizon                 # EFS export root + efs-nfs StorageClass
+./day2/verify-storage.sh -a horizon
+./day2/setup-registry.sh -a horizon                # registry PVC + the S3-stanza patch
+./day2/verify-registry.sh -a horizon               # build -> push -> pull round-trip
+./day2/post-install-cleanup.sh -a horizon          # storage operator + dead StorageClasses
+
+# Day-2 (scripts/ — run whenever)
 ./scripts/tunnel.sh -a horizon                     # SSM port-forward, 6443
 sudo -E ./scripts/tunnel.sh -a horizon --all \
   --profile <profile>                              # 6443 + 443 (console)
 ./scripts/update-kubeconfig.sh -a horizon          # merge into ~/.kube/config
 sudo ./scripts/trust-cluster-ca.sh -a horizon      # trust the cluster's own CAs, once/machine
 sudo ./scripts/setup-apps-dns.sh -a horizon        # resolve *.apps wildcard, once/machine (macOS)
+./scripts/cluster-health.sh -a horizon             # oc get co, known-inert three called out
 ./scripts/hibernate.sh -a horizon                  # stop instances (EBS still bills)
 ./scripts/wake.sh -a horizon
+./scripts/teardown.sh -a horizon [--keep-bastion]  # asks for confirmation first
 ```
 
 ### Tests
@@ -81,6 +90,12 @@ terraform test -filter=tests/04_ec2_launch.tftest.hcl   # a single test file
 `run-all.sh` wraps the suite with the SCP-denial probes and a cleanup sweep, and
 is the normal entry point. Shell changes: `shellcheck -x scripts/<name>.sh`
 (only SC1091 on the `read-tfvars.sh` source is expected).
+
+`07_efs.tftest.hcl` covers EFS — the entire storage design has no fallback if
+it's blocked (no CSI driver can ever work here either), so `scp-probes.sh`
+also probes `elasticfilesystem:CreateFileSystem` as an expected-ALLOW (a
+`BLOCKED` result means the account has no storage answer at all) alongside the
+expected-DENY `iam:CreateUser` / `iam:CreateOpenIDConnectProvider` probes.
 
 ## Architecture
 
@@ -180,8 +195,18 @@ leaving ingress `Available=False` forever and objects wedged on finalizers.
 
 - **Scripts** take `-a <account-alias>`, source `scripts/lib/read-tfvars.sh`, and
   read config straight from `accounts/<alias>.tfvars` — no terraform state, no
-  required working directory. Day-2 scripts find instances by the
-  `Project=openshift-upi` + `AccountAlias=<alias>` default tags.
+  required working directory. Instance-discovery scripts find them by the
+  `Project=openshift-upi` + `AccountAlias=<alias>` default tags; `oc`-based
+  scripts read `.ignition/<alias>/auth/kubeconfig` directly rather than
+  depending on `~/.kube/config` having been merged.
+- **`day2/` vs `scripts/`**: `day2/` holds the run-once scripts that finish a
+  build off after `openshift-install wait-for install-complete` — storage,
+  registry, post-install cleanup (see `day2/README.md`). `scripts/` is
+  everything meant to run repeatedly across a cluster's whole lifetime —
+  access (`tunnel.sh`), lifecycle (`hibernate.sh`/`wake.sh`/`teardown.sh`),
+  and diagnostics (`cluster-health.sh`, `check-known-inert.sh`). Both follow
+  the same script conventions on this list; the split is about *when* you run
+  something, not how it's written.
 - **Target bash 3.2** — what macOS ships and what `/usr/bin/env bash` resolves to
   here. No `wait -n`, no associative arrays.
 - `set -uo pipefail`, not `-e`, wherever a non-zero exit is normal input
