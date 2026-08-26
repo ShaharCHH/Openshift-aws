@@ -1,11 +1,13 @@
-# Session state — 19 Aug 2026
+# Session state — 24 Aug 2026
 
 Point-in-time handoff, not a design doc. `docs/architecture.md`, `docs/runbook.md`
 and `docs/scp-blockers.md` are the durable references; if this file disagrees with
 them, they win. Delete it once its next-steps are done.
 
-> **The cluster is RUNNING, not hibernated.** It was woken this session and left
-> up. Hibernate it when you are done: `./scripts/hibernate.sh -a horizon`.
+> **Cluster state as of this session's start: unknown.** The 19 Aug handoff left
+> it running; nothing in this session touched AWS credentials or the live
+> cluster, so its current state (running/hibernated) has not been re-verified.
+> Check before assuming either way.
 
 | | |
 |---|---|
@@ -14,73 +16,83 @@ them, they win. Delete it once its next-steps are done.
 | RHCOS AMI | `ami-093702d1ac869e178` |
 | Bastion AMI | `ami-0487e9d84db7c95ff` (pinned) |
 | EFS | `fs-0c1fcee2e853c5026` |
-| Nodes | 3 masters, compact topology, schedulable, all `Ready` |
+| Nodes | 3 masters, compact topology, schedulable, all `Ready` (as of 19 Aug) |
 
 ---
 
-## 1. What happened today
+## 1. What happened this session
 
-**The hibernate/wake cycle was survived for the first time.** That was the open
-risk in yesterday's handoff — the cluster had never been stopped and started
-again. All three masters came back with their addresses intact, so the
-NetworkManager keyfile fix holds beyond the MCO reboot it was written for. The
-first reachability probe after `wake.sh` returned all-closed and looked like the
-old bug returning; it was just early boot. Give it the 10 minutes the runbook
-asks for.
+This was a **repo-only** session — no AWS credentials, no live cluster access.
+Everything below is code/docs, none of it has been run against the real cluster
+yet. That's the next session's job (section 3).
 
-**The internal image registry now exists**, reversing the earlier "no registry,
-by choice" decision — that choice existed only because there was no storage, and
-`efs-nfs` removed the reason. PVC-backed, 2 replicas on RWX, full build → push →
-pull round-trip verified, blobs confirmed on EFS.
+**Closed a real reproducibility gap: the EFS export root.** The storage
+provisioner needs `/openshift` pre-created on EFS, mode 1777 — documented in two
+places but created by nothing in the repo; someone did it by hand on this
+cluster. Fixed:
+- `terraform/main.tf` now gives the bastion an EFS client security-group rule.
+- `terraform/templates/bastion-userdata.sh.tpl` installs `nfs-utils`.
+- New `day2/prepare-efs-root.sh` does the one-time mount/mkdir/chmod over SSM,
+  idempotently. **Untested against a real bastion.**
 
-Also done: dynamic RWX storage re-verified after the reboot; the double-default
-StorageClass fixed (`gp3-csi` annotation dropped).
+**Added a `day2/` folder** for the run-once, end-of-build scripts that were
+previously hand-typed `oc` commands in the runbook: `prepare-efs-root.sh`,
+`apply-storage.sh`, `verify-storage.sh`, `setup-registry.sh`,
+`verify-registry.sh`, `post-install-cleanup.sh`. `scripts/` (unchanged
+location) gained five recurring ones: `cluster-health.sh`,
+`check-known-inert.sh`, `serial-console.sh`, `teardown.sh`, `hosts-entries.sh`.
+See `day2/README.md` and `CLAUDE.md` for the run order and the `day2/` vs
+`scripts/` split. **None of these eleven scripts have been run against a real
+cluster.** They're shellchecked clean and exercise their own arg-parsing/error
+paths, but the actual `oc`/SSM logic is unverified.
 
-## 2. Three corrections to yesterday's handoff
+**Added EFS coverage to preflight**, closing the gap flagged in
+`docs/scp-blockers.md`: `scp-probes.sh` now also probes
+`elasticfilesystem:CreateFileSystem` (expected ALLOW — new `BLOCKED` outcome
+if it isn't) and `iam:CreateUser` / `iam:CreateOpenIDConnectProvider` (expected
+DENY). New `preflight/tests/07_efs.tftest.hcl` + `preflight/fixtures/efs`
+creates a real filesystem and mount target. `report.sh` and
+`cleanup-orphans.sh` updated to match. **Not yet run** — needs a real account
+to exercise `terraform test` + `run-all.sh`.
 
-These mattered enough to fix in the durable docs:
+## 2. What's still exactly as the 19 Aug handoff left it
 
-1. **`control-plane-machine-set` is not Degraded because "UPI masters have no
-   `Machine` objects."** They do have them. The machine controller cannot
-   reconcile them: `aws credentials secret openshift-machine-api/aws-cloud-credentials
-   ... not found`. Same credential wall as everything else.
-2. **`oc patch storage cluster ... managementState: Removed` does not work.**
-   The operator rejects it — `Removed is not supported for storage operator` —
-   and adds a second degraded condition on top of the one you were clearing.
-   **This is currently set on the cluster and should be put back to `Managed`.**
-3. **The durable docs had never received the storage or ingress decisions.**
-   Deleting this file, as its predecessor instructed, would have destroyed the
-   reasoning behind the whole storage design. Both are now in
-   `docs/architecture.md`, along with the two new IAM denials and the
-   IMDS-from-pods dead end in `docs/scp-blockers.md`.
+1. **The storage operator's `managementState` may still be set to the
+   unsupported `Removed`.** `day2/post-install-cleanup.sh` now automates the
+   fix (put it back to `Managed`, then try the ClusterCSIDriver lever, which
+   is still **untested**) — but running it is next-session's job, not done
+   here.
+2. **Onboarding docx.** Still deferred by choice. Findings remain in
+   `docs/scp-blockers.md`.
 
-A fourth manifestation of the credential wall turned up while checking:
-`cloud-network-config-controller` is stuck in `ContainerCreating` on `secret
-"cloud-credentials" not found`, which is why `network` sits permanently
-`Progressing`. Benign — documented as known-inert.
+## 3. Next steps (the live verification pass)
 
-## 3. Next steps
+Needs `aws sso login` + a tunnel. In order:
 
-1. **Revert the storage operator** — see correction 2 above:
-   ```
-   oc patch storage cluster --type=merge -p '{"spec":{"managementState":"Managed"}}'
-   ```
-   Then try `oc patch clustercsidriver ebs.csi.aws.com --type=merge -p
-   '{"spec":{"managementState":"Removed"}}'`, which is the supported lever and is
-   **untested**. If it is also refused, `storage` stays Degraded on this
-   platform — record that and stop patching at it.
-2. **Preflight canaries (was item 7, still open).** Planned in detail but not
-   started: node-to-node reachability across all four security groups, plus
-   `iam:CreateUser` / `iam:CreateOpenIDConnectProvider` deny-probes and an EFS
-   allow-probe for `scp-probes.sh`. The worker rows matter most — this topology
-   runs `compute.replicas: 0`, so no bring-up here has ever put a packet through
-   a worker rule.
-3. **Onboarding docx (was item 6).** Deferred deliberately — you want to rethink
-   it rather than regenerate v2 plus deltas. Findings are safe in
-   `docs/scp-blockers.md` meanwhile.
+1. `terraform apply` with all three `TF_VAR_*` values exported — this is what
+   actually creates the bastion→EFS security-group rule from this session's
+   Terraform change. The existing bastion won't have `nfs-utils` from userdata
+   either (userdata only runs at first boot); `prepare-efs-root.sh` installs it
+   itself over SSM, so no bastion rebuild should be needed, but confirm.
+2. `./day2/prepare-efs-root.sh -a horizon` — should report `/openshift`
+   already correct (it was made by hand previously), proving the idempotency
+   check works before trusting it anywhere else.
+3. `./day2/post-install-cleanup.sh -a horizon` — the real test of the
+   ClusterCSIDriver lever and the StorageClass deletion. Whatever it reports,
+   write the answer into `docs/runbook.md`'s Post-install cleanup section —
+   that question has been open since 19 Aug.
+4. `./day2/verify-storage.sh` and `./day2/verify-registry.sh -a horizon` —
+   confirm nothing broke.
+5. `./scripts/cluster-health.sh -a horizon`.
+6. `cd preflight && terraform test -filter=tests/07_efs.tftest.hcl`, then
+   `../scripts/preflight/run-all.sh -a horizon` — first real run of the new
+   EFS/IAM probes.
+7. `./scripts/hibernate.sh -a horizon` when done, given the cluster's state is
+   unverified going into this (see the banner above).
 
 ### Known-inert, do not chase
 
 `control-plane-machine-set` Degraded, `storage` Degraded, and `network`
 Progressing all trace to the same missing cloud credential. See
-`docs/runbook.md`'s "Known-inert" list.
+`docs/runbook.md`'s "Known-inert" list. `scripts/check-known-inert.sh` now
+automates the condition-message check that used to be manual.

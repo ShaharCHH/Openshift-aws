@@ -8,18 +8,22 @@ account:
 
 1. **The capabilities UPI actually needs work** — security groups, ENIs, IAM
    roles/instance profiles, S3 read/write, launching an instance and
-   reaching it via SSM, and outbound internet access from the private
-   subnet (the bastion's ignition/haproxy-config S3 pull depends on this —
-   see `docs/architecture.md`). The launch/SSM canaries deliberately use an
-   AWS-owned base AMI, not RHCOS — AMI *ownership* restrictions are a
-   separate, already-solved concern (`scripts/ami-build/build-custom-ami.sh`),
-   not a generic launch-capability question.
+   reaching it via SSM, outbound internet access from the private subnet
+   (the bastion's ignition/haproxy-config S3 pull depends on this — see
+   `docs/architecture.md`), and **EFS** (`elasticfilesystem:CreateFileSystem`
+   + a mount target) — the entire storage design has no fallback if this is
+   blocked, since no CSI driver can ever work here either. The launch/SSM
+   canaries deliberately use an AWS-owned base AMI, not RHCOS — AMI
+   *ownership* restrictions are a separate, already-solved concern
+   (`scripts/ami-build/build-custom-ami.sh`), not a generic launch-capability
+   question.
 2. **The capabilities we're deliberately avoiding are still blocked (or
    aren't)** — `ec2:CreateVpc`, `ec2:AllocateAddress`,
-   `elasticloadbalancing:CreateLoadBalancer`. See `docs/scp-blockers.md` —
-   note that two other real findings (AMI-ownership restrictions, the
-   vmimport block) came from manual end-to-end testing, not this automated
-   probe, and aren't yet covered by a fast canary here.
+   `elasticloadbalancing:CreateLoadBalancer`, `iam:CreateUser`,
+   `iam:CreateOpenIDConnectProvider`. See `docs/scp-blockers.md` — note that
+   two other real findings (AMI-ownership restrictions, the vmimport block)
+   came from manual end-to-end testing, not this automated probe, and aren't
+   yet covered by a fast canary here.
 
 Both checks create real, minimal resources and clean them up afterward —
 this is not a static/offline check. It needs real AWS credentials for the
@@ -59,6 +63,14 @@ machine-readable version, or the console table for a quick read.
 - An SCP probe reporting **INCONCLUSIVE** means the probe failed for a
   reason other than an authorization error (e.g. a parameter validation
   issue). Never treated as proof of anything — investigate directly.
+- An SCP probe reporting **BLOCKED** means the one probe expected to
+  *succeed* — `elasticfilesystem:CreateFileSystem` — came back denied
+  instead. This is the serious one: it means this account has no storage
+  answer at all under this design (see `docs/architecture.md`'s storage
+  section for why every AWS-credentialed alternative is already ruled out).
+  Don't proceed past Phase 0 without resolving this — a client account that
+  fails here will otherwise pass every other check and only surface the
+  problem partway through Phase 8, with a live cluster already up.
 
 ## Cleanup guarantees
 

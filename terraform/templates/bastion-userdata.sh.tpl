@@ -7,7 +7,7 @@
 # the self-heal timer this script installs).
 set -euo pipefail
 
-dnf install -y docker bind-utils awscli tar gzip
+dnf install -y docker bind-utils awscli tar gzip nfs-utils
 systemctl enable --now docker
 
 mkdir -p /etc/coredns /etc/haproxy /var/ignition-serve/ignition /var/ignition-serve/haproxy

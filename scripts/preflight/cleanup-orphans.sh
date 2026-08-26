@@ -88,6 +88,27 @@ for arn in $resources; do
       echo "  deleting instance profile $name"
       aws iam delete-instance-profile --instance-profile-name "$name" 2>/dev/null || true
       ;;
+    *:iam::*:user/*)
+      name="${arn##*/}"
+      echo "  deleting iam user $name"
+      aws iam delete-user --user-name "$name" 2>/dev/null \
+        || echo "    (delete failed, may still have attached policies/keys -- check manually)"
+      ;;
+    *:iam::*:oidc-provider/*)
+      echo "  deleting oidc provider $arn"
+      aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$arn" 2>/dev/null
+      ;;
+    *:elasticfilesystem:*:file-system/*)
+      id="${arn##*/}"
+      echo "  deleting efs filesystem $id"
+      # A mount target still attached blocks delete-file-system; the EFS
+      # preflight canary doesn't leave one behind, but retry briefly in case
+      # something else does.
+      for _ in 1 2 3 4 5; do
+        aws efs delete-file-system --region "$region" --file-system-id "$id" >/dev/null 2>&1 && break
+        sleep 5
+      done
+      ;;
     *)
       echo "  (no cleanup handler for this resource type, skipping: $arn)"
       ;;
