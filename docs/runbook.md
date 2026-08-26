@@ -353,6 +353,21 @@ the console loads and then login fails on an unresolvable name:
 
 `tunnel.sh` checks for both and prints the line to add if either is missing.
 
+**The console still won't load cleanly even with all of that.** Both the API
+and the ingress wildcard are signed by CAs the cluster minted for itself —
+there is no public CA to get instead (`docs/scp-blockers.md` rows 1, 3, 4) —
+so the browser has never heard of either root and shows a full interstitial.
+`oc` is unaffected (its kubeconfig embeds the API CA inline); trust the other
+two roots once per machine:
+
+```
+sudo ./scripts/trust-cluster-ca.sh -a horizon
+```
+
+Needs the API+console tunnel above already running for the ingress half —
+that CA only exists inside the cluster (`cm/default-ingress-cert`). See
+`docs/architecture.md` for which cert in each bundle this installs and why.
+
 ---
 
 ## Phase 8 — Storage
@@ -590,6 +605,18 @@ tunnels is worse than none.
 Heavy or long-running work is still better done from the bastion itself, which
 reaches the API over the VPC with no tunnel in the path.
 
+**Trusting the cluster's own CAs** — one-time per machine, so the browser
+stops throwing a TLS interstitial on the console and `curl` stops failing
+with `SSL certificate problem`:
+
+```
+sudo ./scripts/trust-cluster-ca.sh -a horizon
+```
+
+See Phase 7 above and `docs/architecture.md` for what this installs and why.
+`--uninstall` removes it again; `--dry-run` shows what would happen without
+touching the trust store or needing root.
+
 **Pausing between work sessions** — stops instances, pausing compute
 billing. EBS volumes bill regardless, so this is for gaps of days, not
 weeks; for anything longer, destroy and rebuild:
@@ -659,6 +686,7 @@ patience has proven necessary.
 | `GET error: ... EOF` on port 22623 | DNS and TCP are fine; HAProxy's MCS backend list is empty. Normal if no bootstrap is running |
 | Nodes in emergency mode ~90s after launch, `failed to fetch config: resource not found` | The bastion's ignition server answered 404 — it was replaced in the same apply that created the nodes, so it was still empty when they booted. EC2 status checks read `ok`/`ok` throughout. Replace the nodes once the bastion is serving; check `ls /var/ignition-serve/ignition/` on it first |
 | Every node goes `NotReady` at once, `Kubelet stopped posting node status`, all within seconds of each other | The nodes rebooted (almost certainly an MCO rollout) and came back with no IP. Check the console banner for `ens5:` with nothing after it. The kernel args only configure the initramfs; the real root needs the NetworkManager keyfile from `templates/node-network.nmconnection.tpl`. Note `:6443` can stay open through this — CRI-O keeps existing containers running even with kubelet down, so an open port is not proof of a healthy node |
+| Browser shows `NET::ERR_CERT_AUTHORITY_INVALID` on the console, or `curl: (60) SSL certificate problem: self signed certificate in certificate chain` | Expected until `scripts/trust-cluster-ca.sh -a <alias>` has been run on this machine — the cluster signs its own API and ingress certs, and there is no public CA to get instead. `oc` is unaffected; this only matters for the browser, `curl`, and anything else that reads the OS trust store |
 | Nodes stay `NotReady` forever, `aws-cloud-controller-manager` in CrashLoopBackOff | Missing `cluster_infra_id` tag, or a missing EC2 permission on the master role. Read the pod's actual logs — it names the exact denied action |
 | `oc` reports `TLS handshake timeout` while `wait-for` runs fine | SSM tunnel contention. Run `oc` from the bastion |
 | `ingress` stuck `Available=False`, router Service at `EXTERNAL-IP <pending>`, operator logging `SyncLoadBalancerFailed` | The default IngressController was not pinned to `HostNetwork` before `create ignition-configs`. It is trying to build an SCP-denied ELB. `endpointPublishingStrategy` is immutable once the object exists, so this cannot be patched — the IngressController has to be deleted and recreated. Cheaper to regenerate ignition and reinstall |

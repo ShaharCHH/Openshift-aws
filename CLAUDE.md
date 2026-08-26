@@ -59,6 +59,7 @@ terraform apply -var-file=../accounts/horizon.tfvars \
 sudo -E ./scripts/tunnel.sh -a horizon --all \
   --profile <profile>                              # 6443 + 443 (console)
 ./scripts/update-kubeconfig.sh -a horizon          # merge into ~/.kube/config
+sudo ./scripts/trust-cluster-ca.sh -a horizon      # trust the cluster's own CAs, once/machine
 ./scripts/hibernate.sh -a horizon                  # stop instances (EBS still bills)
 ./scripts/wake.sh -a horizon
 ```

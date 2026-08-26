@@ -272,6 +272,65 @@ manifests are still editable: between `create manifests` and
 `create ignition-configs`. This is the same window, and the same reasoning, as
 any other install-time-only override.
 
+## The cluster is its own CA, and the operator's machine has to be told so
+
+There is no public CA anywhere in this design and there cannot be one: no
+Route 53, no ELB, no public endpoint at all (`docs/scp-blockers.md` rows 1, 3,
+4). Every certificate the cluster serves is signed by a root it minted for
+itself, and nothing outside the cluster has ever heard of that root —
+`scripts/trust-cluster-ca.sh` is the fix, installed into the operator's own
+machine trust store, once, per machine.
+
+`oc` is unaffected by any of this. `openshift-install`'s admin kubeconfig
+embeds the API's CA inline as `certificate-authority-data`, so `oc` and
+`kubectl` verify the tunnel's TLS correctly with no setup. The problem is
+everything else that instead consults the OS trust store — a browser hitting
+the console, `curl`, anything that isn't `oc`.
+
+There are two roots to install, not one, because the API and the ingress
+router are signed by two entirely separate CAs with no relationship to each
+other:
+
+| Endpoint | Leaf CN | Root CA | Where it lives |
+|---|---|---|---|
+| `api.<cluster>.<domain>:6443` | `api.<cluster>.<domain>` | `kube-apiserver-lb-signer` | `.ignition/<alias>/auth/kubeconfig`, offline |
+| `*.apps.<cluster>.<domain>` | `*.apps.<cluster>.<domain>` | `ingress-operator@<unix-ts>` | `cm/default-ingress-cert` in `openshift-config-managed`, cluster-only |
+
+Two things make extracting these two roots less trivial than "copy the PEM
+out of a file":
+
+- **The kubeconfig's CA bundle holds three self-signed roots, not one** —
+  `kube-apiserver-localhost-signer`, `kube-apiserver-service-network-signer`,
+  and `kube-apiserver-lb-signer`. Only the `lb-signer` one signs anything the
+  operator's machine actually talks to; the other two exist for in-cluster
+  traffic this machine never sees. Trusting all three machine-wide would work
+  but widens what's trusted for no benefit — `trust-cluster-ca.sh` picks out
+  the one that matters by subject.
+- **`default-ingress-cert`'s bundle is the wildcard leaf, then its root** —
+  in that order. The leaf is not what belongs in a trust store: it's a server
+  cert with its own, shorter expiry, not a CA. Only the self-signed member of
+  the bundle (subject == issuer) goes in.
+
+`create manifests` mints a fresh cluster CA on every rebuild (see "Regenerate
+ignition in full on every rebuild" in `CLAUDE.md`), so re-running the install
+produces a *different* `kube-apiserver-lb-signer` cert under the identical
+subject — the CN is a constant across every cluster this repo ever builds.
+There is nothing cluster-specific inside it to key a cleanup off of, which is
+why `trust-cluster-ca.sh` has no state file: `--uninstall` re-derives the
+current fingerprints from the same live sources rather than remembering what
+it installed last time, and on install it surfaces (never auto-removes) any
+other cert already trusted under that same CN — almost certainly a stale root
+left by an earlier rebuild.
+
+When the authenticated sources aren't available — no kubeconfig yet, or the
+cluster unreachable through the tunnel — the script falls back to scraping the
+TLS chain served on the tunnel's local port and trusts it on first use, but
+only after checking the scraped root is actually self-signed, that the leaf
+served alongside it verifies against it, and that the leaf's SAN covers the
+name being trusted. That fallback exists for bootstrap-adjacent moments (no
+merged kubeconfig yet) more than routine use — the authenticated sources are
+preferred whenever they're reachable.
+
 ## Storage: EFS used as a plain NFS server, not through a CSI driver
 
 The short version: **this cluster cannot hold a cloud credential**, so it
