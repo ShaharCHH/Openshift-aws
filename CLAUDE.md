@@ -68,6 +68,8 @@ sudo -E ./scripts/tunnel.sh -a horizon --all \
 ./scripts/update-kubeconfig.sh -a horizon          # merge into ~/.kube/config
 sudo ./scripts/trust-cluster-ca.sh -a horizon      # trust the cluster's own CAs, once/machine
 sudo ./scripts/setup-apps-dns.sh -a horizon        # resolve *.apps wildcard, once/machine (macOS)
+./scripts/manage-cluster-users.sh -a horizon --add <user> --admin --verify  # add a named login
+./scripts/manage-cluster-users.sh -a horizon --list                        # who can log in, and how
 ./scripts/cluster-health.sh -a horizon             # oc get co, known-inert three called out
 ./scripts/hibernate.sh -a horizon                  # stop instances (EBS still bills)
 ./scripts/wake.sh -a horizon
@@ -213,6 +215,12 @@ leaving ingress `Available=False` forever and objects wedged on finalizers.
   (supervise loops, deny-probes).
 - Comments carry the *evidence*, not just intent. Existing ones record real probe
   output and failure signatures; match that when adding to them.
+- **Never `oc apply` a full `OAuth` object, and never `oc patch --type=merge`
+  its `identityProviders`.** That field is `x-kubernetes-list-type: atomic` —
+  both replace the entire identity-provider list with no error and no diff,
+  silently deleting every other configured provider. Use a `jq` read-modify-
+  write instead, editing one entry in place; see
+  `scripts/manage-cluster-users.sh` and `docs/architecture.md`.
 - **Adding a `.tftest.hcl`**: every run block using an explicit
   `module { source = ... }` needs its own `provider "aws" {}` in the file plus
   `providers = { aws = aws }` on the block, or it fails with a confusing
