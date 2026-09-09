@@ -69,6 +69,8 @@
 
 <p>The result is that <b>no software component inside this cluster can call an AWS API, under any circumstance, for any reason.</b> This single fact is the root cause of every item in Section 5.</p>
 
+<p>The same two closed mechanisms also rule out deferring <i>human</i> login to an AWS-side or federated identity provider &#8212; that path needs exactly the credential-issuing capability this section describes as unavailable. Section 5 records the consequence.</p>
+
 <h2>5. What is permanently compromised</h2>
 
 <p>The following are direct, verified consequences of Section 4 and are not expected to change without a policy relaxation. Each was confirmed on the running cluster rather than inferred.</p>
@@ -82,6 +84,7 @@
 <tr><td>Internal image registry</td><td>Running, but backed by file storage rather than object storage, despite object storage being network-reachable from this environment &#8212; the obstacle is exclusively the identity restriction in Section 4, not connectivity. Red Hat's published guidance advises against this storage backend for the registry; a full read/write cycle has been verified working, but this configuration carries a caveat the vendor has not fully validated.</td></tr>
 <tr><td>Application traffic routing (ingress)</td><td>Runs directly on the master nodes' own network interfaces rather than behind a managed load balancer &#8212; a decision that is fixed at install time and cannot be changed afterward without rebuilding the cluster's networking configuration from scratch.</td></tr>
 <tr><td>Single point of failure</td><td>DNS, load balancing, and node boot delivery all run on one administrative instance. A managed AWS deployment would normally distribute these across redundant, AWS-operated services; here, that redundancy does not exist.</td></tr>
+<tr><td>Cluster user authentication</td><td>Every cloud-backed login method &#8212; AWS IAM, IAM Identity Center, or any external identity provider &#8212; is closed off by the same restriction as Section 4. Human logins to the cluster are instead served by a password file the cluster stores and manages itself. There is no central user directory, no single sign-on, and no shared group membership with the rest of the organization; adding, rotating, and removing individual logins is a manual, per-cluster task. Confirmed on the running cluster, not inferred.</td></tr>
 </table>
 
 <h2>6. Where the effort went</h2>
@@ -114,6 +117,9 @@
 <li>There is no direct network path to the cluster from outside the account. Every operational session &#8212; viewing the console, running commands against the cluster &#8212; is relayed through a port-forwarding session over Systems Manager, which must be established before each use.</li>
 <li>These relayed sessions time out after a period of inactivity, and the disconnect is silent &#8212; it does not produce an error at the time it happens, only on the next command issued afterward.</li>
 <li>Two operational sessions run with elevated local privileges can collide on the same network port without a clear signal as to why, if a previous session was left running.</li>
+<li>Individual cluster logins are created, rotated, and revoked by hand on each cluster, rather than through a shared directory that would cover every cluster at once.</li>
+<li>Any such change to who can log in briefly interrupts the login system cluster-wide while it takes effect.</li>
+<li>Removing someone's login does not, by itself, immediately end a session they already have open; an additional step is required, and takes effect within roughly half a minute rather than instantly.</li>
 </ul>
 
 <h2>8. Recommendations</h2>
@@ -121,7 +127,7 @@
 <p>The relaxations below are ordered by how much of the cost documented in this report each one would retire, most valuable first. Any one of them can be granted independently of the others.</p>
 
 <ol>
-<li><b>Permit issuing a federated (OIDC) identity to in-cluster software.</b> This single change would retire Section 4 in its entirety: cloud-native block storage would become available, the storage and machine-lifecycle fault conditions in Section 5 would clear, and the image registry could move to object storage without the vendor's caveat. This is the highest-leverage change available.</li>
+<li><b>Permit issuing a federated (OIDC) identity to in-cluster software.</b> This single change would retire Section 4 in its entirety: cloud-native block storage would become available, the storage and machine-lifecycle fault conditions in Section 5 would clear, and the image registry could move to object storage without the vendor's caveat. It would also retire the local password file in the new authentication row in Section 5, letting the cluster defer human login to the organization's own identity provider instead. This is the highest-leverage change available.</li>
 <li><b>Permit load balancer creation.</b> Would retire the administrative instance's role as a software load balancer and remove the install-time-only, unchangeable ingress decision described in Section 5.</li>
 <li><b>Permit Route 53 hosted-zone management.</b> Would retire the self-hosted DNS component and its associated single point of failure.</li>
 <li><b>Permit copying vendor-owned machine images, or use of the standard image-import pipeline.</b> Would retire the custom image-build step (Section 3.5) and, combined with the standard import pipeline, would reopen the simpler installation method ruled out in Section 6.1.</li>
