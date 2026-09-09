@@ -110,13 +110,67 @@ jq --arg alias "$account_alias" '
   .["current-context"] = $alias
 ' <<<"$source_json" > "$renamed_kubeconfig"
 
+# Splits a multi-cert PEM bundle into cert-1.pem, cert-2.pem, ... in $2.
+# Same approach as scripts/trust-cluster-ca.sh's split_pem_bundle --
+# `openssl x509` on its own only ever reads the FIRST cert in a bundle.
+split_pem_bundle() {
+  local bundle="$1" outdir="$2"
+  mkdir -p "$outdir"
+  awk -v dir="$outdir" '
+    /-----BEGIN CERTIFICATE-----/ { n++; capturing=1 }
+    capturing { print > (dir "/cert-" n ".pem") }
+    /-----END CERTIFICATE-----/ { capturing=0 }
+  ' "$bundle"
+}
+
+# Prints the SHA-1 fingerprint of the kube-apiserver-lb-signer cert inside a
+# base64 certificate-authority-data value read from stdin, empty if absent.
+lb_signer_fingerprint() {
+  local tmp f fp=""
+  tmp=$(mktemp -d)
+  base64 -d > "$tmp/bundle.pem" 2>/dev/null
+  split_pem_bundle "$tmp/bundle.pem" "$tmp/split"
+  for f in "$tmp/split"/cert-*.pem; do
+    [ -e "$f" ] || continue
+    if openssl x509 -noout -subject -in "$f" 2>/dev/null | grep -q "kube-apiserver-lb-signer"; then
+      fp=$(openssl x509 -noout -fingerprint -sha1 -in "$f" 2>/dev/null)
+    fi
+  done
+  rm -rf "$tmp"
+  [ -n "$fp" ] && echo "$fp"
+}
+
 if [ -f "$target" ]; then
   backup="$target.bak-$(date +%s)"
   cp "$target" "$backup"
   echo "Backed up existing kubeconfig to $backup"
 fi
 
-KUBECONFIG="$target:$renamed_kubeconfig" oc config view --flatten > "$merged_kubeconfig"
+# Renamed source first: kubectl's merge takes the FIRST file's value for a
+# conflicting key, and after a cluster rebuild $target still holds the
+# previous generation's cluster entry (and CA) under this same alias.
+# Target-first silently kept a stale CA here and reported success -- seen
+# for real 27 Aug 2026, producing an x509 "unknown authority" loop on
+# `oc get no` that persisted even after scripts/trust-cluster-ca.sh (which
+# can't help -- oc never consults the OS trust store, only this file).
+KUBECONFIG="$renamed_kubeconfig:$target" oc config view --flatten > "$merged_kubeconfig"
+
+# Guard against a repeat: confirm the merge actually picked up the source's
+# API CA rather than silently keeping whatever $target had for this alias.
+source_ca_b64=$(jq -r '.clusters[0].cluster."certificate-authority-data" // empty' <<<"$source_json")
+merged_ca_b64=$(oc config view --kubeconfig="$merged_kubeconfig" --raw -o json |
+  jq -r --arg a "$account_alias" '.clusters[] | select(.name == $a) | .cluster."certificate-authority-data" // empty')
+
+source_fp=$(lb_signer_fingerprint <<<"$source_ca_b64")
+merged_fp=$(lb_signer_fingerprint <<<"$merged_ca_b64")
+
+if [ -n "$source_fp" ] && [ "$source_fp" != "$merged_fp" ]; then
+  echo "ERROR: merge did not pick up the source's API CA -- refusing to write $target." >&2
+  echo "  source lb-signer: $source_fp" >&2
+  echo "  merged lb-signer: $merged_fp" >&2
+  exit 1
+fi
+
 mv "$merged_kubeconfig" "$target"
 oc --kubeconfig "$target" config use-context "$account_alias" >/dev/null
 

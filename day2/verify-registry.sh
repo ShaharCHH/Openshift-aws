@@ -42,6 +42,17 @@ command -v oc >/dev/null 2>&1 || {
   exit 1
 }
 
+# `oc new-project` below switches the current context and writes that back
+# into whatever kubeconfig it was given. Pointing that at the admin
+# kubeconfig corrupts it from a 1/1/1 admin shape into a multi-context one,
+# which then trips the shape guard in scripts/update-kubeconfig.sh -- seen
+# for real 27 Aug 2026, 8 minutes after a kubeconfig merge, leaving that
+# script unable to run again until the file was repaired by hand. Work on a
+# throwaway copy instead.
+scratch_kubeconfig="$(mktemp)"
+cp "$kubeconfig" "$scratch_kubeconfig"
+kubeconfig="$scratch_kubeconfig"
+
 oc_cmd() { oc --kubeconfig "$kubeconfig" "$@"; }
 
 project="registry-verify-$(date +%s)"
@@ -50,6 +61,7 @@ build_dir=""
 cleanup() {
   oc_cmd delete project "$project" --ignore-not-found >/dev/null 2>&1 || true
   [ -n "$build_dir" ] && rm -rf "$build_dir"
+  rm -f "$scratch_kubeconfig"
 }
 trap cleanup EXIT
 

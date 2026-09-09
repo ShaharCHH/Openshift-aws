@@ -290,6 +290,18 @@ console, `curl`, anything that isn't `oc` talking straight to `:6443` — **and,
 once an identity provider exists, `oc login` itself**: see "Cluster login:
 htpasswd" below for why that command specifically needs the ingress CA too.
 
+Because of that, `trust-cluster-ca.sh` cannot be the fix for an `oc`-side x509
+error, no matter how it's run — `oc` never opens the keychain. If `oc get no`
+fails with `certificate signed by unknown authority`, the merged
+`~/.kube/config` (`scripts/update-kubeconfig.sh`) is carrying a **previous
+cluster generation's** `certificate-authority-data`: a rebuild mints a fresh
+CA under an identical CN (see below), so an already-merged kubeconfig goes
+stale exactly the same way an already-trusted keychain entry does, just for a
+different tool. Re-running `update-kubeconfig.sh` after every rebuild is what
+actually clears it — confirmed for real 27 Aug 2026, where a stale merge from
+before a rebuild produced this loop for over a week despite the keychain
+being correctly populated the whole time.
+
 There are two roots to install, not one, because the API and the ingress
 router are signed by two entirely separate CAs with no relationship to each
 other:
