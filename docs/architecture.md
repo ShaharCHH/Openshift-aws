@@ -281,11 +281,14 @@ itself, and nothing outside the cluster has ever heard of that root —
 `scripts/trust-cluster-ca.sh` is the fix, installed into the operator's own
 machine trust store, once, per machine.
 
-`oc` is unaffected by any of this. `openshift-install`'s admin kubeconfig
-embeds the API's CA inline as `certificate-authority-data`, so `oc` and
-`kubectl` verify the tunnel's TLS correctly with no setup. The problem is
-everything else that instead consults the OS trust store — a browser hitting
-the console, `curl`, anything that isn't `oc`.
+`oc` is unaffected by any of this **for calls that use the admin kubeconfig
+directly against `:6443`**. `openshift-install`'s admin kubeconfig embeds the
+API's CA inline as `certificate-authority-data`, so `oc get`/`oc apply`/etc.
+verify the tunnel's TLS correctly with no setup. The problem is everything
+else that instead consults the OS trust store — a browser hitting the
+console, `curl`, anything that isn't `oc` talking straight to `:6443` — **and,
+once an identity provider exists, `oc login` itself**: see "Cluster login:
+htpasswd" below for why that command specifically needs the ingress CA too.
 
 Because of that, `trust-cluster-ca.sh` cannot be the fix for an `oc`-side x509
 error, no matter how it's run — `oc` never opens the keychain. If `oc get no`
@@ -370,6 +373,147 @@ needs no `destinationCACertificate` of its own. This is also why the service
 CA is absent from the table above and from `trust-cluster-ca.sh` — trusting
 it on the client side would be trusting a CA for names it was never issued
 for.
+
+## Cluster login: htpasswd, because no identity provider here can hold a credential
+
+Before this, the only human login was the shared `kubeadmin` password: one
+bootstrap credential with cluster-admin, no per-person identity, no way to
+revoke one operator without rotating for everyone. OpenShift treats it as
+temporary and expects a real identity provider in its place.
+
+**HTPasswd was chosen by elimination, not preference.** Every cloud-IAM-backed
+identity provider needs the cluster to hold or broker an AWS credential, and
+this cluster cannot — that is the same credential wall documented above and
+in `CLAUDE.md`: `iam:CreateUser` and `iam:CreateOpenIDConnectProvider` are
+SCP-denied, and pods on the OVN pod network cannot reach IMDS to borrow the
+node's identity either. External SSO (LDAP, an org's own OIDC provider) needs
+an egress path this cluster does not have. HTPasswd needs neither: it is a
+password file the cluster stores itself. If a future reader is tempted to
+"upgrade" this to something IdP-shaped, the credential wall is still there —
+check `docs/scp-blockers.md` before assuming it has moved.
+
+`scripts/manage-cluster-users.sh` is the tool. **The cluster's `htpass-secret`
+(namespace `openshift-config`) is the source of truth; the local cache at
+`.ignition/<alias>/auth/htpasswd` is disposable** — bcrypt is one-way, so the
+local file holds no information the secret doesn't, and every mutating run
+pulls from the cluster first rather than trusting what's on disk.
+
+### Why there is no `manifests/auth/oauth-htpasswd.yaml`
+
+Every other manifest in this repo (`manifests/registry/*.yaml`, etc.) is
+something safe to `oc apply` repeatedly: it creates or fully owns an object.
+`OAuth/cluster` fails that pattern on both counts:
+
+- It **always already exists** — created by the cluster-version operator,
+  owned by `ClusterVersion`, annotated `release.openshift.io/create-only:
+  "true"`. The operation needed here is *mutate a field of a foreign object*,
+  not *create one*.
+- **`spec.identityProviders` is `x-kubernetes-list-type: atomic`** (verified
+  by reading the installed CRD). Atomic means the list is replaced as a
+  whole on any write to it — there is no per-element merge. Both of the
+  obvious ways to change it destroy every *other* identity provider with no
+  error and no diff:
+  - `oc apply -f <a full OAuth object>` replaces the list.
+  - `oc patch --type=merge -p '{"spec":{"identityProviders":[...]}}'` — a
+    JSON merge patch replaces arrays wholesale too. Also replaces the list.
+
+  A checked-in manifest would sit in the runbook right beside manifests that
+  *are* safe to re-apply, and would silently delete a future second identity
+  provider (LDAP, say) the day someone adds one. So the script does a
+  read-modify-write instead: read the current list with `jq`, replace only
+  the entry named `htpasswd` in place (or append it, first time), write the
+  full list back — and skip the patch entirely when the result is
+  byte-identical, since even a no-op patch bumps `resourceVersion` and rolls
+  all three `oauth-openshift` pods for nothing.
+
+**The identity provider's name is permanent once used.** It is baked into
+every `Identity` object as `<idp-name>:<username>` — renaming it later
+orphans every existing user's Identity at once, at the same time. The name is
+plain `htpasswd`; it is also what renders as the console's login button
+label, so it doubles as user-facing text.
+
+### Deletion is four objects, not one
+
+`User` and `Identity` are cluster-scoped, with no owner reference and nothing
+that garbage-collects them. Removing a line from `htpass-secret` removes only
+the *ability to authenticate* — three other things can still be true after
+that:
+
+- **Live tokens keep working.** OAuth access tokens last 24h. Stop at the
+  htpasswd line and a removed user's open console tab and `oc` session keep
+  working until that token expires on its own.
+- **A stale `Identity` breaks the *next* login, not the removed user's
+  current one** — it points at a `User` UID that may no longer resolve
+  cleanly, and the failure looks like nothing in `oc get co`.
+- **A dangling `cluster-admin` binding is the dangerous one.** RBAC subjects
+  are plain strings — a `ClusterRoleBinding` binds the literal name `alice`,
+  not a stable identity. Delete Alice, leave the binding, and hand the
+  username `alice` to a different person six months later: she is silently
+  cluster-admin on first login.
+
+`--delete` therefore removes the htpasswd line, the `Identity`, the `User`,
+every live `oauthaccesstoken`/`oauthauthorizetoken` naming that user, and (by
+default; `--keep-rbac` opts out) any `cluster-admin` binding naming them —
+**in that order**, secret first so no new login can start with the old
+password while the rest runs.
+
+Deleting the `User` is what actually revokes existing sessions — the token
+authenticator resolves a token's `userName` to a `User` object and checks its
+UID, so a token surviving that lookup is what "logged in" means. This is not
+literally synchronous: there's a short positive-authentication cache in
+front of that check. Measured live against this cluster: a token was still
+accepted 10 seconds after the delete command completed, and rejected by 25
+seconds. Fast — nothing like the up-to-24h exposure of stopping at the
+htpasswd line alone — but a real, non-zero window, worth knowing about
+before treating "the delete command returned" as "access ended this
+instant."
+
+### Rollout: every mutation rolls all three `oauth-openshift` pods, sometimes twice
+
+The authentication operator copies `htpass-secret` into a projected volume
+(`v4-0-config-user-idp-0-file-data`) and folds the resourceVersions it
+watches into the pod-template annotation `operator.openshift.io/rvs-hash`.
+That annotation changing is what triggers the `oauth-openshift` Deployment
+rollout (`maxSurge:3, maxUnavailable:2` — so logins can briefly fail
+mid-rollout, not fail outright).
+
+**One rollout is not always enough to wait for.** Verified live: `oc get co
+authentication` can report `Available=True Progressing=False Degraded=False`
+while the Deployment is still mid-rollout — old pods `Terminating`, new ones
+`Pending` — so a login attempt in that window can still 401 against a pod
+serving the old secret. Worse, the operator can react to the secret change
+with a short lag and start a *second*, corrective rollout just after the
+first one converges: `oc rollout status` reported success for a rollout
+built from a stale `rvs-hash`, and a fresh rollout carrying the real content
+began roughly 15 seconds later. `manage-cluster-users.sh` waits on the
+Deployment's rollout, re-checks whether its generation is still moving, and
+only then polls `co/authentication` — never on `oc get co` in aggregate,
+since `network` and `storage` are permanently `Progressing=True` on this
+cluster (see `docs/runbook.md`, Known-inert) and an aggregate wait would
+never terminate.
+
+### Lockout: three doors, and OAuth can only close one
+
+1. **The admin kubeconfig's client certificate** — `O=system:masters,
+   CN=system:admin`, signed by `admin-kubeconfig-signer` (verified valid to
+   2036-08-15), bound to `cluster-admin` via the bootstrap
+   `ClusterRoleBinding`. It authenticates at the kube-apiserver by client
+   certificate and **never touches OAuth at all** — no change to the OAuth
+   CR, a missing or malformed secret, or a deleted identity provider can
+   affect it. This is the real break-glass, and the reason htpasswd changes
+   here are low-risk.
+2. **`kubeadmin`** — implemented outside `spec.identityProviders` entirely
+   (its own `operator.openshift.io/bootstrap-user-exists` annotation), so it
+   survives a totally broken htpasswd IdP. Kept deliberately as a second
+   door, not removed by this tooling.
+3. **htpasswd** — the new one, and the only door any of this script's
+   commands can affect.
+
+The one genuine break this design can cause is a missing or malformed
+`htpass-secret` with the OAuth CR still pointing at it. Doors 1 and 2 are
+unaffected either way; recovery is `--sync` to refresh the local cache from
+whatever the cluster currently has, then `--add` through door 1 (the admin
+kubeconfig).
 
 ## Storage: EFS used as a plain NFS server, not through a CSI driver
 

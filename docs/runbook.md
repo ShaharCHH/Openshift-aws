@@ -357,8 +357,11 @@ the console loads and then login fails on an unresolvable name:
 and the ingress wildcard are signed by CAs the cluster minted for itself —
 there is no public CA to get instead (`docs/scp-blockers.md` rows 1, 3, 4) —
 so the browser has never heard of either root and shows a full interstitial.
-`oc` is unaffected (its kubeconfig embeds the API CA inline); trust the other
-two roots once per machine:
+`oc` using the admin kubeconfig directly against `:6443` is unaffected (its
+kubeconfig embeds the API CA inline) — **but `oc login` is not**, once Phase
+10 sets up an identity provider: it authenticates through
+`route/oauth-openshift`, a *passthrough* route on the ingress wildcard, so it
+needs the ingress CA trusted too. Trust both roots once per machine:
 
 ```
 sudo ./scripts/trust-cluster-ca.sh -a horizon
@@ -561,10 +564,62 @@ The mount should read
 
 ---
 
+## Phase 10 — Cluster login
+
+The installer leaves exactly one way to log in: the shared `kubeadmin`
+password in `.ignition/horizon/auth/kubeadmin-password`. Named, per-person
+logins go through an HTPasswd identity provider instead — see
+`docs/architecture.md`, "Cluster login: htpasswd", for why HTPasswd
+specifically (chosen by elimination — no other identity provider here can
+hold a credential) and for the design this script implements.
+
+```
+./scripts/manage-cluster-users.sh -a horizon --add <you> --admin --verify
+```
+
+`--verify` proves `oc login` actually works, via a throwaway kubeconfig, before
+you trust the new login for anything. Needs the API+console tunnel and CA
+trust from Phase 7 already in place (`oc login` goes through the ingress
+route, not `:6443` directly — see the Phase 7 amendment above).
+
+Add teammates the same way, omitting `--admin` for anyone who shouldn't have
+cluster-admin — note that **every logged-in user can still create their own
+namespaces by default** (`self-provisioner` is bound cluster-wide to
+`system:authenticated:oauth`; this script does not change that, since it's a
+cluster-wide policy decision, not a per-user one).
+
+```
+./scripts/manage-cluster-users.sh -a horizon --list
+./scripts/manage-cluster-users.sh -a horizon --set-password <user>
+./scripts/manage-cluster-users.sh -a horizon --delete <user>
+```
+
+Every one of `--add` / `--set-password` / `--delete` rolls all three
+`oauth-openshift` pods — batch changes rather than looping the script. See
+`docs/architecture.md` for what `--delete` actually removes (four objects,
+not one) and why.
+
+**`kubeadmin` is not removed by this tooling, and this runbook does not run
+the removal command.** Once at least one admin htpasswd login is verified
+working, retiring `kubeadmin` is:
+
+```
+oc -n kube-system delete secret kubeadmin
+```
+
+Shown here so it's easy to find, not as a step to execute automatically —
+`kubeadmin` is one of the three doors described in `docs/architecture.md`
+("Lockout: three doors"), and removing it is a one-way decision worth making
+on purpose, not as an unattended script step.
+
+---
+
 ## Post-install cleanup
 
-Three things the installer leaves in a state that needs a decision. None are
-optional if you want `oc get clusteroperators` to come back clean.
+Four things the installer leaves in a state that needs a decision. The first
+three are not optional if you want `oc get clusteroperators` to come back
+clean; the fourth (Phase 10, above) is a decision to make on its own
+timeline, not something `post-install-cleanup.sh` touches.
 
 ```
 ./day2/post-install-cleanup.sh -a horizon
@@ -724,6 +779,21 @@ See Phase 7 above and `docs/architecture.md` for what this installs and why.
 `--uninstall` removes it again; `--dry-run` shows what would happen without
 touching the trust store or needing root.
 
+**Managing cluster logins** — add, rotate, remove, or list named per-person
+logins through the htpasswd identity provider set up in Phase 10:
+
+```
+./scripts/manage-cluster-users.sh -a horizon --list
+./scripts/manage-cluster-users.sh -a horizon --add <user> [--admin] --verify
+./scripts/manage-cluster-users.sh -a horizon --set-password <user>
+./scripts/manage-cluster-users.sh -a horizon --delete <user>
+```
+
+`--verify` needs the API+console tunnel and CA trust above already in place.
+See Phase 10 and `docs/architecture.md` for what each mode actually touches —
+in particular, `--delete` removes four objects, not one, and every mutating
+mode rolls all three `oauth-openshift` pods.
+
 **Checking cluster health** — `oc get clusteroperators` includes three
 operators expected to stay unhealthy forever on this platform (see
 "Known-inert" below), which makes a real new problem easy to miss in the noise:
@@ -814,8 +884,12 @@ patience has proven necessary.
 | `GET error: ... EOF` on port 22623 | DNS and TCP are fine; HAProxy's MCS backend list is empty. Normal if no bootstrap is running |
 | Nodes in emergency mode ~90s after launch, `failed to fetch config: resource not found` | The bastion's ignition server answered 404 — it was replaced in the same apply that created the nodes, so it was still empty when they booted. EC2 status checks read `ok`/`ok` throughout. Replace the nodes once the bastion is serving; check `ls /var/ignition-serve/ignition/` on it first |
 | Every node goes `NotReady` at once, `Kubelet stopped posting node status`, all within seconds of each other | The nodes rebooted (almost certainly an MCO rollout) and came back with no IP. Check the console banner for `ens5:` with nothing after it. The kernel args only configure the initramfs; the real root needs the NetworkManager keyfile from `templates/node-network.nmconnection.tpl`. Note `:6443` can stay open through this — CRI-O keeps existing containers running even with kubelet down, so an open port is not proof of a healthy node |
-| Browser shows `NET::ERR_CERT_AUTHORITY_INVALID` on the console, or `curl: (60) SSL certificate problem: self signed certificate in certificate chain` | Expected until `scripts/trust-cluster-ca.sh -a <alias>` has been run on this machine — the cluster signs its own API and ingress certs, and there is no public CA to get instead. `oc` is unaffected; this only matters for the browser, `curl`, and anything else that reads the OS trust store |
-| `oc get no`/`oc get co` reports `x509: certificate signed by unknown authority` even after running `trust-cluster-ca.sh` | Wrong fix for this tool — `oc` never consults the OS trust store, only `certificate-authority-data` embedded in whatever kubeconfig it loads. The merged `~/.kube/config` is carrying a **previous cluster generation's** CA: `create manifests` mints a fresh one under an identical CN on every rebuild, and merging in the fresh admin kubeconfig again is what actually fixes it. Re-run `scripts/update-kubeconfig.sh -a <alias>` and confirm the `kube-apiserver-lb-signer` fingerprint in `~/.kube/config` now matches `.ignition/<alias>/certs/api-ca.pem` |
+| Browser shows `NET::ERR_CERT_AUTHORITY_INVALID` on the console, or `curl: (60) SSL certificate problem: self signed certificate in certificate chain` | Expected until `scripts/trust-cluster-ca.sh -a <alias>` has been run on this machine — the cluster signs its own API and ingress certs, and there is no public CA to get instead. `oc` calls against the admin kubeconfig are unaffected; this matters for the browser, `curl`, and — once Phase 10 sets up an identity provider — `oc login` itself |
+| `oc login <api-url> -u <user> -p ...` fails with an x509 error even though `oc get co` against the admin kubeconfig works fine | `oc login` authenticates through `route/oauth-openshift`, a passthrough route on the ingress wildcard — a completely different CA from the API's. Run `scripts/trust-cluster-ca.sh -a <alias>` (not `--api-only`); see Phase 7's amendment and `docs/architecture.md` |
+| `oc login` fails with `dial tcp 127.0.0.1:443: connect: connection refused` | Only the API tunnel is up (`tunnel.sh -a <alias>` with no `--console`/`--all`). `oc login` needs the 443 tunnel too, since it goes through the ingress route, not `:6443` |
+| `oc login` succeeds with the right password, but as a different or unexpected identity, or fails outright with no clear reason | A stale `Identity` object pointing at a `User` UID that no longer resolves cleanly — usually from a `User` deleted by hand outside `manage-cluster-users.sh`. Run `--sync` then `--list` to see current state; `--delete <user>` followed by `--add <user>` repairs it |
+| A user removed with `manage-cluster-users.sh --delete` can still `oc login` or keeps a working console session | If this lasts more than ~30 seconds after the delete command completed, something is wrong — measured live, a deleted user's token was rejected within 25s. Longer than that suggests the `User`/`Identity`/token deletion steps didn't actually run; check the script's output for errors rather than assuming it needs more time |
+| `oc get co` looks unhappy right after `manage-cluster-users.sh --add`/`--set-password`/`--delete` | Expected transiently — every one of those rolls all three `oauth-openshift` pods, and `network`/`storage` are permanently unhealthy anyway (see Known-inert below). Re-run `oc get co authentication` specifically; it should read `Available=True Progressing=False Degraded=False` within a couple of minutes |
 | `certificate is valid for image-registry.openshift-image-registry.svc, not <route>....apps...` | The registry route is `passthrough`, not `reencrypt` — see Phase 9. Trusting more CAs will not fix this; the served cert's SAN never covers the route hostname no matter which CA signs it. Switch to `manifests/registry/registry-route.yaml` |
 | `dig`/`nslookup` report `NXDOMAIN` for a `*.apps` name but the browser and `curl` reach it fine | Expected after `scripts/setup-apps-dns.sh` — both tools query DNS servers directly and bypass `/etc/hosts` and `/etc/resolver` entirely. Use `dscacheutil -q host -a name <name>` instead, which reflects both |
 | Nodes stay `NotReady` forever, `aws-cloud-controller-manager` in CrashLoopBackOff | Missing `cluster_infra_id` tag, or a missing EC2 permission on the master role. Read the pod's actual logs — it names the exact denied action |
@@ -880,3 +954,10 @@ bastion-sourced rule covered it. Both now exist in `modules/security-groups`.
   `ClusterCSIDriver`-level removal in Post-install cleanup turns out to work,
   this operator stays Degraded on this platform. Treat it as inert; do not keep
   patching at it.
+
+**Why this matters for anything that waits on cluster health**: `network` and
+`storage` are `Progressing=True` *permanently* on this cluster, not
+transiently. Any "wait until every operator is green" loop never terminates
+here — `manage-cluster-users.sh` learned this the hard way and gates its own
+rollout wait on `co/authentication` specifically, never on `oc get co` in
+aggregate. Write new tooling the same way.
