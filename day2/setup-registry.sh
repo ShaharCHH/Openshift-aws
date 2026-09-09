@@ -4,11 +4,15 @@
 # hold an AWS credential (docs/architecture.md's storage section).
 #
 # Replaces docs/runbook.md's Phase 9. The step people get wrong: on AWS the
-# registry operator defaults spec.storage to s3 AND auto-detects a PVC named
-# image-registry-storage, filling in spec.storage.pvc too. A merge patch that
-# only adds `pvc` leaves `s3` in place and the operator refuses to do
-# anything ("exactly one storage type should be configured ... got 2: [S3
-# PVC]") -- the S3 key has to be nulled explicitly.
+# registry operator defaults spec.storage to s3, and it does NOT auto-detect
+# an existing image-registry-storage PVC -- nulling s3 alone leaves storage
+# empty, and the operator's own defaulter puts s3 right back (confirmed via
+# its logs: "object changed: ... added:spec.storage.s3...") because
+# platform-AWS defaulting runs before any PVC auto-detection. `pvc.claim` has
+# to be set explicitly in the same merge patch that nulls `s3`, or the
+# operator loops forever on "unable to get cluster minted credentials
+# ... installer-cloud-credentials" -- it's still trying to sync the S3
+# backend it just re-added.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,9 +63,9 @@ if [ "$phase" != "Bound" ]; then
   exit 1
 fi
 
-echo "Nulling the S3 stanza (the step that trips people -- see header comment)..." >&2
+echo "Nulling the S3 stanza and pointing storage at the PVC..." >&2
 oc_cmd patch configs.imageregistry.operator.openshift.io/cluster --type=merge \
-  -p '{"spec":{"storage":{"s3":null}}}'
+  -p '{"spec":{"storage":{"s3":null,"pvc":{"claim":"image-registry-storage"}}}}'
 
 echo "Waiting for the image-registry clusteroperator to settle (up to 3 min)..." >&2
 available="Unknown"
