@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Proves the internal image registry can actually store and serve an image,
-# not just that the clusteroperator reports Available=True -- and confirms
-# the blobs really landed on EFS rather than somewhere ephemeral. Replaces
-# the manual round-trip in docs/runbook.md's Phase 9.
+# not just that the clusteroperator reports Available=True -- confirms the
+# blobs really landed on EFS rather than somewhere ephemeral, and checks the
+# external route day2/setup-registry.sh applies is healthy (reencrypt,
+# admitted). Replaces the manual round-trip in docs/runbook.md's Phase 9.
 #
 # If the build fails with `InvalidOutputReference` / `Output image could not
 # be resolved`, that means openshift-controller-manager is still holding the
@@ -138,4 +139,38 @@ if ! echo "$mount_line" | grep -qE '\.efs\.[a-z0-9-]+\.amazonaws\.com:/openshift
 fi
 
 echo >&2
-echo "PASS: build -> push -> pull round-trip verified, blobs confirmed on EFS." >&2
+echo "Checking the external route (day2/setup-registry.sh always applies it)..." >&2
+termination=$(oc_cmd get route registry -n openshift-image-registry \
+  -o jsonpath='{.spec.tls.termination}' 2>/dev/null || echo "")
+admitted=$(oc_cmd get route registry -n openshift-image-registry \
+  -o jsonpath='{.status.ingress[0].conditions[?(@.type=="Admitted")].status}' 2>/dev/null || echo "")
+route_host=$(oc_cmd get route registry -n openshift-image-registry -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+
+if [ "$termination" != "reencrypt" ]; then
+  echo "FAIL: route 'registry' is '$termination', not reencrypt -- see manifests/registry/registry-route.yaml for why passthrough doesn't work." >&2
+  exit 1
+fi
+if [ "$admitted" != "True" ]; then
+  echo "FAIL: route 'registry' is not Admitted." >&2
+  exit 1
+fi
+echo "Route OK: $route_host (reencrypt, admitted)." >&2
+
+# Reaching the route from wherever this script runs needs the console/443
+# tunnel and *.apps DNS (docs/runbook.md's Phase 9) -- neither is guaranteed
+# on the machine running this script (e.g. run from the bastion, which
+# resolves *.apps itself but has no reason to run the tunnel). Treat
+# reachability as best-effort: report it, don't fail the round-trip on it.
+if command -v curl >/dev/null 2>&1; then
+  http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "https://${route_host}/v2/" 2>/dev/null || echo "000")
+  if [ "$http_code" = "000" ]; then
+    echo "NOTE: https://${route_host}/v2/ not reachable from this machine (got no response) -- expected unless the console tunnel and *.apps DNS are set up here (docs/runbook.md's Phase 9). The route itself is healthy." >&2
+  else
+    echo "External route reachable and serving valid TLS: https://${route_host}/v2/ -> HTTP $http_code." >&2
+  fi
+else
+  echo "NOTE: curl not on PATH, skipping external reachability check." >&2
+fi
+
+echo >&2
+echo "PASS: build -> push -> pull round-trip verified, blobs confirmed on EFS, external route healthy." >&2

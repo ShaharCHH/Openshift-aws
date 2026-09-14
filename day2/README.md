@@ -12,8 +12,8 @@ Run in this order:
 ./day2/apply-storage.sh -a <alias>      # prepares the EFS export root, then
                                           # applies the NFS provisioner + efs-nfs
 ./day2/verify-storage.sh -a <alias>     # proves a PVC actually binds
-./day2/setup-registry.sh -a <alias>     # registry PVC + the S3-stanza patch
-./day2/verify-registry.sh -a <alias>    # build -> push -> pull round-trip
+./day2/setup-registry.sh -a <alias>     # registry PVC + the S3-stanza patch + external route
+./day2/verify-registry.sh -a <alias>    # build -> push -> pull round-trip + route check
 ./day2/post-install-cleanup.sh -a <alias>   # storage operator, StorageClasses,
                                               # known-inert operator check
 ```
