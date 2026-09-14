@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Enables the internal image registry, backed by a PVC on efs-nfs instead of
 # its native S3 backend -- the registry runs as a pod, and no pod here can
-# hold an AWS credential (docs/architecture.md's storage section).
+# hold an AWS credential (docs/architecture.md's storage section) -- and
+# exposes it outside the cluster with the reencrypt route from
+# manifests/registry/registry-route.yaml, so it can be reached with
+# podman/skopeo/oc image from a laptop, not just from in-cluster builds.
 #
 # Replaces docs/runbook.md's Phase 9. The step people get wrong: on AWS the
 # registry operator defaults spec.storage to s3, and it does NOT auto-detect
@@ -83,4 +86,39 @@ if [ "$available" != "True" ]; then
   exit 1
 fi
 
-echo "Done. Registry is Available. Verify a real round-trip with day2/verify-registry.sh -a $account_alias." >&2
+# A passthrough route (hand-created, or from an earlier attempt) claims the
+# same "registry" hostname as the reencrypt one below and fails the same way
+# documented in manifests/registry/registry-route.yaml: the pod's
+# service-ca-signed cert has no SAN for any route hostname, so external
+# clients get a hostname-mismatch error no matter which CA they trust.
+existing_termination=$(oc_cmd get route registry -n openshift-image-registry \
+  -o jsonpath='{.spec.tls.termination}' 2>/dev/null || echo "")
+if [ -n "$existing_termination" ] && [ "$existing_termination" != "reencrypt" ]; then
+  echo "Removing existing '$existing_termination' route named 'registry' -- it would conflict with the reencrypt one." >&2
+  oc_cmd delete route registry -n openshift-image-registry
+fi
+
+echo "Applying the external route (reencrypt -- see manifests/registry/registry-route.yaml for why)..." >&2
+oc_cmd apply -f "$repo_root/manifests/registry/registry-route.yaml"
+
+echo "Waiting for the route to be admitted (up to 60s)..." >&2
+admitted="Unknown"
+for _ in $(seq 1 12); do
+  admitted=$(oc_cmd get route registry -n openshift-image-registry \
+    -o jsonpath='{.status.ingress[0].conditions[?(@.type=="Admitted")].status}' 2>/dev/null || echo "Unknown")
+  [ "$admitted" = "True" ] && break
+  sleep 5
+done
+
+route_host=$(oc_cmd get route registry -n openshift-image-registry -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+oc_cmd get route registry -n openshift-image-registry
+
+if [ "$admitted" != "True" ]; then
+  echo "WARNING: route not admitted yet -- inspect the route above." >&2
+  exit 1
+fi
+
+echo "Done. Registry is Available and the external route ($route_host) is admitted." >&2
+echo "Verify a real round-trip, including external push/pull, with day2/verify-registry.sh -a $account_alias." >&2
+echo "To push from a laptop: scripts/tunnel.sh -a $account_alias --console (or --all), then either" >&2
+echo "an /etc/hosts entry for $route_host or sudo scripts/setup-apps-dns.sh -a $account_alias." >&2

@@ -432,19 +432,24 @@ oc delete pvc scratch
 The registry is backed by a PVC on `efs-nfs`. Its native S3 backend is not an
 option here for the same reason no CSI driver works: the registry runs as a pod,
 and pods in this cluster cannot hold an AWS credential. See
-`docs/architecture.md`.
+`docs/architecture.md`. `setup-registry.sh` also applies the external
+`reencrypt` route so the registry can be reached with `podman`/`skopeo`/`oc
+image` from a laptop, not just from in-cluster builds.
 
 ```
 ./day2/setup-registry.sh -a horizon
 ./day2/verify-registry.sh -a horizon
 ```
 
-`setup-registry.sh` applies the PVC, waits for `Bound`, then clears the S3
-stanza and waits for the operator to settle. `verify-registry.sh` does a real
-build → push → pull round-trip and confirms the blobs landed on EFS, not
-somewhere ephemeral — and if the build fails with `InvalidOutputReference`, it
-restarts `openshift-controller-manager` and retries once automatically (see
-below for why that's the fix). The underlying commands:
+`setup-registry.sh` applies the PVC, waits for `Bound`, clears the S3 stanza
+and waits for the operator to settle, then applies the external route and
+waits for it to be admitted (removing a conflicting non-`reencrypt` route
+first, if one exists). `verify-registry.sh` does a real build → push → pull
+round-trip, confirms the blobs landed on EFS, not somewhere ephemeral, and
+checks the route is `reencrypt` and admitted — and if the build fails with
+`InvalidOutputReference`, it restarts `openshift-controller-manager` and
+retries once automatically (see below for why that's the fix). The
+underlying commands:
 
 ```
 oc apply -f manifests/registry/registry-pvc.yaml
@@ -480,6 +485,9 @@ oc get pods -n openshift-image-registry
 ```
 
 ### Exposing it outside the cluster: reencrypt, never passthrough
+
+`setup-registry.sh` applies this automatically now; the underlying command
+if you need to redo it by hand:
 
 ```
 oc apply -f manifests/registry/registry-route.yaml
