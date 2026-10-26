@@ -27,6 +27,11 @@ module "s3" {
   source = "./modules/s3"
 
   bucket_name = "${local.name_prefix}-${data.aws_caller_identity.current.account_id}"
+
+  # The bucket is versioned, so every haproxy-config/ignition upload leaves
+  # noncurrent versions behind; without this, teardown.sh's `terraform destroy`
+  # fails with BucketNotEmpty. Everything in it is regenerable from the repo.
+  force_destroy = true
 }
 
 module "bastion" {
